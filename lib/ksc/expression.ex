@@ -93,6 +93,18 @@ defmodule Ksc.Expression do
       String.starts_with?(expr, "[") and String.ends_with?(expr, "]") ->
         translate_byte_array(expr, mode)
 
+      # _io.pos and _io.size - special handling
+      expr == "_io.pos" ->
+        "io_pos"
+      expr == "_io.size" ->
+        "io_size"
+      expr == "_io.eof" ->
+        "(io_pos >= io_size)"
+
+      # _is_le special variable for default_endian_expr
+      expr == "_is_le" ->
+        "var__is_le"
+
       # Method/field access: expr.method
       has_dot_access?(expr) ->
         translate_dot_access(expr, mode)
@@ -117,10 +129,27 @@ defmodule Ksc.Expression do
   end
 
   defp matching_paren_at_end?(expr) do
-    # Check if the opening paren matches the closing one
     chars = String.graphemes(expr)
-    if hd(chars) != "(" or List.last(chars) != ")", do: false, else: true
-    # Simple check - could be more robust but works for most cases
+    if hd(chars) != "(" or List.last(chars) != ")" do
+      false
+    else
+      # Walk from position 1, tracking depth. If depth reaches 0 before the last char,
+      # the opening paren doesn't match the closing one.
+      inner = Enum.slice(chars, 1..-2//1)
+      {balanced, _} = Enum.reduce_while(inner, {true, 1}, fn ch, {_, depth} ->
+        new_depth = case ch do
+          "(" -> depth + 1
+          ")" -> depth - 1
+          _ -> depth
+        end
+        if new_depth == 0 do
+          {:halt, {false, 0}}
+        else
+          {:cont, {true, new_depth}}
+        end
+      end)
+      balanced
+    end
   end
 
   defp translate_byte_array(expr, mode) do
@@ -232,8 +261,8 @@ defmodule Ksc.Expression do
 
     case String.trim(op) do
       "*" -> "(#{do_translate(left, mode)} * #{do_translate(right, mode)})"
-      "/" -> "div(#{do_translate(left, mode)}, #{do_translate(right, mode)})"
-      "%" -> "rem(#{do_translate(left, mode)}, #{do_translate(right, mode)})"
+      "/" -> "Ksc.Stream.floor_div(#{do_translate(left, mode)}, #{do_translate(right, mode)})"
+      "%" -> "Ksc.Stream.floor_mod(#{do_translate(left, mode)}, #{do_translate(right, mode)})"
     end
   end
 
@@ -246,7 +275,7 @@ defmodule Ksc.Expression do
 
         case method do
           "size" -> "Ksc.Stream.kaitai_size(#{do_translate(obj, mode)})"
-          "length" -> "byte_size(#{do_translate(obj, mode)})"
+          "length" -> "Ksc.Stream.kaitai_length(#{do_translate(obj, mode)})"
           "to_i" -> "Ksc.Stream.to_i(#{do_translate(obj, mode)})"
           "to_s" -> "to_string(#{do_translate(obj, mode)})"
           "to_f" -> "(#{do_translate(obj, mode)} / 1.0)"
@@ -281,7 +310,12 @@ defmodule Ksc.Expression do
                 do_translate(obj, mode)
               true ->
                 translated_obj = do_translate(obj, mode)
-                "#{translated_obj}.#{method}"
+                # Field access on a parsed result - use map access
+                if Regex.match?(~r/^[a-z_][a-zA-Z0-9_]*$/, method) do
+                  "#{translated_obj}[:#{method}]"
+                else
+                  "#{translated_obj}.#{method}"
+                end
             end
         end
     end
@@ -357,9 +391,10 @@ defmodule Ksc.Expression do
 
   defp translate_identifier(name, mode) do
     case name do
-      "_root" -> "root"
+      "_root" -> "root_"
       "_parent" -> "parent_"
       "_io" -> "_io"
+      "_index" -> "var__index"
       "_" when mode == :repeat_until -> "item"
       "_" -> "_"
       "true" -> "true"

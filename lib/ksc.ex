@@ -13,7 +13,60 @@ defmodule Ksc do
   """
   def compile(ksy_path) do
     spec = Parser.parse_file(ksy_path)
-    {:ok, ElixirCompiler.compile(spec)}
+    formats_dir = Path.dirname(ksy_path)
+
+    # Compile imported types first
+    import_sources = compile_imports(spec.imports, formats_dir, [])
+
+    source = ElixirCompiler.compile(spec)
+    {:ok, Enum.join(import_sources ++ [source], "\n\n")}
+  end
+
+  defp compile_imports(imports, dir, acc) do
+    compile_imports(imports, dir, acc, MapSet.new())
+  end
+
+  defp compile_imports([], _dir, acc, _seen), do: Enum.reverse(acc)
+  defp compile_imports([imp | rest], dir, acc, seen) do
+    # Handle relative imports (starting with /) vs simple names
+    imp_name = if String.starts_with?(imp, "/") do
+      String.trim_leading(imp, "/")
+    else
+      imp
+    end
+
+    # Skip circular imports
+    if MapSet.member?(seen, imp_name) do
+      compile_imports(rest, dir, acc, seen)
+    else
+      seen = MapSet.put(seen, imp_name)
+
+      # Try to find the .ksy file
+      ksy_path = find_import(imp_name, dir)
+
+      if ksy_path && File.exists?(ksy_path) do
+        spec = Parser.parse_file(ksy_path)
+        # Recursively compile this import's imports
+        sub_dir = Path.dirname(ksy_path)
+        sub_imports = compile_imports(spec.imports, sub_dir, [], seen)
+        source = ElixirCompiler.compile(spec)
+        compile_imports(rest, dir, [source | sub_imports] ++ acc, seen)
+      else
+        compile_imports(rest, dir, acc, seen)
+      end
+    end
+  end
+
+  defp find_import(name, dir) do
+    # Try direct path first
+    direct = Path.join(dir, "#{name}.ksy")
+    if File.exists?(direct) do
+      direct
+    else
+      # Try nested path (e.g., "common/vlq_base128_le")
+      nested = Path.join(dir, "#{name}.ksy")
+      if File.exists?(nested), do: nested, else: nil
+    end
   end
 
   @doc """

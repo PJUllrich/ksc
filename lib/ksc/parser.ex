@@ -14,7 +14,7 @@ defmodule Ksc.Parser do
   def parse_class(nil), do: %ClassSpec{}
 
   def parse_class(map) when is_map(map) do
-    meta = Map.get(map, "meta", %{})
+    meta = Map.get(map, "meta", %{}) || %{}
 
     %ClassSpec{
       id: Map.get(meta, "id"),
@@ -24,7 +24,9 @@ defmodule Ksc.Parser do
       seq: parse_seq(Map.get(map, "seq", [])),
       types: parse_types(Map.get(map, "types", %{})),
       instances: parse_instances(Map.get(map, "instances", %{})),
-      enums: parse_enums(Map.get(map, "enums", %{}))
+      enums: parse_enums(Map.get(map, "enums", %{})),
+      imports: Map.get(meta, "imports", []) || [],
+      params: parse_params(Map.get(map, "params"))
     }
   end
 
@@ -150,6 +152,17 @@ defmodule Ksc.Parser do
       pad_right: Map.get(map, "pad-right"),
       include: Map.get(map, "include")
     }
+  end
+
+  defp parse_params(nil), do: []
+  defp parse_params(list) when is_list(list) do
+    Enum.map(list, fn param ->
+      %{
+        id: Map.get(param, "id"),
+        type: Map.get(param, "type"),
+        enum: Map.get(param, "enum")
+      }
+    end)
   end
 
   defp parse_enums(nil), do: %{}

@@ -70,6 +70,12 @@ defmodule Ksc.Compiler.ElixirCompiler do
 
   defp compile_public_api(%ClassSpec{} = spec) do
     has_instances = map_size(spec.instances) > 0
+    has_params = (spec.params || []) != []
+
+    # Don't generate from_binary for parameterized types
+    if has_params do
+      ""
+    else
 
     from_binary =
       if has_instances do
@@ -79,7 +85,7 @@ defmodule Ksc.Compiler.ElixirCompiler do
         end
 
         def from_binary(data) when is_binary(data) do
-          {result, _rest} = parse(data, data)
+          {result, _rest} = parse(data, %{})
           resolve_instances(result, data)
         end
         """
@@ -90,18 +96,29 @@ defmodule Ksc.Compiler.ElixirCompiler do
         end
 
         def from_binary(data) when is_binary(data) do
-          {result, _rest} = parse(data, data)
+          {result, _rest} = parse(data, %{})
           result
         end
         """
       end
 
     String.trim(from_binary)
+
+    end # has_params else
   end
 
   defp compile_parse_function(%ClassSpec{} = spec, endian, type_registry) do
+    params = spec.params || []
+    param_names = Enum.map(params, fn p -> "var_#{p.id}" end)
+    has_params = params != []
+
     if spec.seq == [] do
-      "def parse(data, _root) do\n  {%{}, data}\nend"
+      if has_params do
+        args = Enum.join(["data", "_root_", "_parent"] ++ param_names, ", ")
+        "def parse(#{args}) do\n  {%{}, data}\nend"
+      else
+        "def parse(data, _root_, _parent \\\\ nil) do\n  {%{}, data}\nend"
+      end
     else
       # Auto-number anonymous fields
       {seq_with_ids, _} = Enum.reduce(spec.seq, {[], 0}, fn attr, {acc, anon_idx} ->
@@ -112,10 +129,10 @@ defmodule Ksc.Compiler.ElixirCompiler do
         end
       end)
 
+      bit_endian = spec.bit_endian
+
       field_parses =
-        Enum.map(seq_with_ids, fn attr ->
-          compile_attr_parse(attr, endian, type_registry, spec)
-        end)
+        compile_attr_parses_with_bits(seq_with_ids, endian, type_registry, spec, bit_endian)
 
       field_names = Enum.map(seq_with_ids, fn attr -> attr.id end)
 
@@ -124,16 +141,154 @@ defmodule Ksc.Compiler.ElixirCompiler do
         |> Enum.map(fn name -> "#{name}: var_#{name}" end)
         |> Enum.join(", ")
 
+      # Check if any user types exist (need result_so_far for parent passing)
+      needs_parent_passing = Enum.any?(seq_with_ids, fn attr ->
+        is_user_type_attr?(attr, endian, type_registry, spec)
+      end)
+
       body = Enum.join(field_parses, "\n")
 
+      # Check if any field uses _io.pos or _io.size
+      all_exprs = collect_all_expressions(seq_with_ids)
+      needs_io = Enum.any?(all_exprs, fn e -> is_binary(e) and (String.contains?(e, "_io.pos") or String.contains?(e, "_io.size") or String.contains?(e, "_io.eof")) end)
+
+      io_init = if needs_io do
+        "io_size = byte_size(data)"
+      else
+        nil
+      end
+
+      io_pos_code = if needs_io do
+        "io_pos = io_size - byte_size(rest)"
+      else
+        nil
+      end
+
+      parent_init = if needs_parent_passing, do: "result_so_far = %{_parent: parent_}", else: nil
+
+      body_lines = [io_init, parent_init, body, io_pos_code]
+        |> Enum.reject(&is_nil/1)
+        |> Enum.join("\n")
+
+      # Insert io_pos updates before each field that references _io
+      body_lines = if needs_io do
+        insert_io_pos_updates(body_lines)
+      else
+        body_lines
+      end
+
+      parse_args = if has_params do
+        Enum.join(["data", "root_", "parent_"] ++ param_names, ", ")
+      else
+        "data, root_, parent_ \\\\ nil"
+      end
+
       """
-      def parse(data, root) do
+      def parse(#{parse_args}) do
         rest = data
-      #{Utils.indent(body, 1)}
+      #{Utils.indent(body_lines, 1)}
         {%{#{result_map}}, rest}
       end
       """
       |> String.trim()
+    end
+  end
+
+  # Group attrs into runs of consecutive bit fields vs non-bit fields, producing code
+  defp compile_attr_parses_with_bits(attrs, endian, type_registry, spec, bit_endian) do
+    # Group into runs: {:bit, [attrs]} or {:normal, attr}
+    groups = group_bit_runs(attrs, endian, type_registry, spec)
+
+    needs_parent = Enum.any?(attrs, fn attr ->
+      is_user_type_attr?(attr, endian, type_registry, spec)
+    end)
+
+    Enum.map(groups, fn
+      {:normal, attr} ->
+        code = compile_attr_parse(attr, endian, type_registry, spec)
+        if needs_parent do
+          code <> "\nresult_so_far = Map.put(result_so_far, :#{attr.id}, var_#{attr.id})"
+        else
+          code
+        end
+
+      {:bit_run, bit_attrs} ->
+        # Generate code that uses bit accumulator state
+        bit_fn = if bit_endian == "le", do: "read_bits_le", else: "read_bits_be"
+        init_code = "bits_state = {0, 0, rest}"
+        field_codes = Enum.map(bit_attrs, fn attr ->
+          var = "var_#{attr.id}"
+          {_match, {:bit, bit_size}} = type_to_pattern(attr.type, endian, attr, type_registry, spec)
+
+          read_code = "{#{var}, bits_state} = Ksc.Stream.#{bit_fn}(bits_state, #{bit_size})"
+
+          # b1 yields boolean (unless enum is applied)
+          read_code = if bit_size == 1 and attr.enum == nil do
+            read_code <> "\n#{var} = #{var} != 0"
+          else
+            read_code
+          end
+
+          # Wrap in conditional if needed
+          if attr.if_expr != nil do
+            condition = translate_expr(attr.if_expr)
+            """
+            {#{var}, bits_state} = if #{condition} do
+              #{read_code}
+              {#{var}, bits_state}
+            else
+              {nil, bits_state}
+            end
+            """
+            |> String.trim()
+          else
+            maybe_wrap_enum(read_code, attr, var)
+          end
+        end)
+        align_code = "rest = Ksc.Stream.align_to_byte(bits_state)"
+        parent_updates = if needs_parent do
+          Enum.map(bit_attrs, fn attr ->
+            "result_so_far = Map.put(result_so_far, :#{attr.id}, var_#{attr.id})"
+          end)
+        else
+          []
+        end
+        Enum.join([init_code | field_codes] ++ [align_code] ++ parent_updates, "\n")
+    end)
+  end
+
+  defp group_bit_runs(attrs, endian, type_registry, spec) do
+    {groups, current_bits} = Enum.reduce(attrs, {[], []}, fn attr, {groups, current_bits} ->
+      if is_bit_type?(attr, endian, type_registry, spec) do
+        {groups, current_bits ++ [attr]}
+      else
+        if current_bits != [] do
+          {groups ++ [{:bit_run, current_bits}, {:normal, attr}], []}
+        else
+          {groups ++ [{:normal, attr}], []}
+        end
+      end
+    end)
+
+    if current_bits != [] do
+      groups ++ [{:bit_run, current_bits}]
+    else
+      groups
+    end
+  end
+
+  defp is_user_type_attr?(%AttrSpec{} = attr, endian, type_registry, spec) do
+    case type_to_pattern(attr.type, endian, attr, type_registry, spec) do
+      {_, :user_type} -> true
+      {_, :switch} -> true  # switch may contain user types
+      _ -> false
+    end
+  end
+
+  defp is_bit_type?(%AttrSpec{} = attr, endian, type_registry, spec) do
+    case type_to_pattern(attr.type, endian, attr, type_registry, spec) do
+      {_, {:bit, _}} -> true
+      _ -> false
     end
   end
 
@@ -160,18 +315,49 @@ defmodule Ksc.Compiler.ElixirCompiler do
 
     code = case type_info do
       :user_type ->
-        type_mod = resolve_type_module(attr.type, type_registry, spec)
-        if attr.size != nil do
-          # Sized user type: extract substream, parse, advance rest
-          size_expr = translate_expr(attr.size)
-          """
-          size_#{attr.id} = #{size_expr}
-          <<#{var}_data::binary-size(size_#{attr.id}), rest::binary>> = rest
-          {#{var}, _} = #{type_mod}.parse(#{var}_data, root)
-          """
-          |> String.trim()
+        {base_type, type_args} = parse_type_args(attr.type)
+        type_mod = resolve_type_module(base_type, type_registry, spec)
+        # Build result map reference for parent passing
+        parent_ref = "result_so_far"
+        # Translate type arguments
+        args_str = if type_args != [] do
+          ", " <> Enum.map_join(type_args, ", ", &translate_expr/1)
         else
-          "{#{var}, rest} = #{type_mod}.parse(rest, root)"
+          ""
+        end
+        cond do
+          attr.size != nil ->
+            # Sized user type: extract substream, apply processing, then parse
+            size_expr = translate_expr(attr.size)
+            extract = """
+            size_#{attr.id} = #{size_expr}
+            <<#{var}_data::binary-size(size_#{attr.id}), rest::binary>> = rest
+            """
+            |> String.trim()
+            # Apply pad/term/process to extracted data before parsing
+            processing = build_data_processing(attr, "#{var}_data")
+            parse_line = "{#{var}, _} = #{type_mod}.parse(#{var}_data, root_, #{parent_ref}#{args_str})"
+            Enum.join([extract | processing] ++ [parse_line], "\n")
+
+          attr.terminator != nil ->
+            # User type with terminator: read until terminator, then parse substream
+            consume = if attr.consume == false, do: "false", else: "true"
+            include = if attr.include == true, do: "true", else: "false"
+            """
+            {#{var}_data, rest} = Ksc.Stream.read_terminated(rest, #{attr.terminator}, #{consume}, #{include})
+            {#{var}, _} = #{type_mod}.parse(#{var}_data, root_, #{parent_ref}#{args_str})
+            """
+            |> String.trim()
+
+          attr.size_eos == true ->
+            """
+            {#{var}, _} = #{type_mod}.parse(rest, root_, #{parent_ref}#{args_str})
+            rest = <<>>
+            """
+            |> String.trim()
+
+          true ->
+            "{#{var}, rest} = #{type_mod}.parse(rest, root_, #{parent_ref}#{args_str})"
         end
 
       :switch ->
@@ -200,22 +386,46 @@ defmodule Ksc.Compiler.ElixirCompiler do
 
       :str ->
         size_expr = translate_expr(attr.size)
-        "size_#{attr.id} = #{size_expr}\n<<#{var}::binary-size(size_#{attr.id}), rest::binary>> = rest"
+        encoding = resolve_encoding(attr, spec)
+        code = "size_#{attr.id} = #{size_expr}\n<<#{var}::binary-size(size_#{attr.id}), rest::binary>> = rest"
+        code = maybe_apply_byte_processing(code, attr, var)
+        maybe_apply_encoding(code, encoding, var)
 
       :str_eos ->
-        "#{var} = rest\nrest = <<>>"
+        encoding = resolve_encoding(attr, spec)
+        code = "#{var} = rest\nrest = <<>>"
+        code = maybe_apply_byte_processing(code, attr, var)
+        maybe_apply_encoding(code, encoding, var)
 
       :strz ->
-        "{#{var}, rest} = Ksc.Stream.read_strz(rest)"
+        encoding = resolve_encoding(attr, spec)
+        consume = if attr.consume == false, do: "false", else: "true"
+        if encoding && String.upcase(encoding) in ["UTF-16LE", "UTF-16BE"] do
+          "{#{var}, rest} = Ksc.Stream.read_strz_enc(rest, \"#{encoding}\", #{consume})"
+        else
+          code = if attr.consume == false do
+            "{#{var}, rest} = Ksc.Stream.read_strz_consume(rest, #{consume})"
+          else
+            "{#{var}, rest} = Ksc.Stream.read_strz(rest)"
+          end
+          maybe_apply_encoding(code, encoding, var)
+        end
 
       :terminated ->
         # Field with terminator but no size - scan for terminator
         consume = if attr.consume == false, do: "false", else: "true"
         include = if attr.include == true, do: "true", else: "false"
-        "{#{var}, rest} = Ksc.Stream.read_terminated(rest, #{attr.terminator}, #{consume}, #{include})"
+        encoding = resolve_encoding(attr, spec)
+        code = "{#{var}, rest} = Ksc.Stream.read_terminated(rest, #{attr.terminator}, #{consume}, #{include})"
+        maybe_apply_encoding(code, encoding, var)
 
       {:bit, size} ->
-        "{#{var}, rest} = Ksc.Stream.read_bits(rest, #{size})"
+        code = "{#{var}, rest} = Ksc.Stream.read_bits(rest, #{size})"
+        if size == 1 do
+          code <> "\n#{var} = #{var} != 0"
+        else
+          code
+        end
 
       _ ->
         "<<#{var}::#{match}, rest::binary>> = rest"
@@ -267,7 +477,7 @@ defmodule Ksc.Compiler.ElixirCompiler do
     inner_code = String.replace(inner_code, "var_#{attr.id}", "item")
 
     """
-    {#{var}, rest} = Enum.reduce(1..max(#{count}, 0)//1, {[], rest}, fn _, {acc, rest} ->
+    {#{var}, rest} = Enum.reduce(Enum.with_index(1..max(#{count}, 0)//1), {[], rest}, fn {_, var__index}, {acc, rest} ->
       #{Utils.indent(inner_code, 1)}
       {acc ++ [item], rest}
     end)
@@ -392,25 +602,51 @@ defmodule Ksc.Compiler.ElixirCompiler do
   end
 
   defp compile_resolve_instances(instances, endian, type_registry, spec) do
+    # Topological sort: resolve instances in dependency order
+    sorted_instances = topological_sort_instances(instances)
+
     assignments =
-      Enum.map(instances, fn {name, %InstanceSpec{} = inst} ->
-        cond do
+      Enum.map(sorted_instances, fn {name, %InstanceSpec{} = inst} ->
+        code = cond do
           inst.value != nil ->
             expr = translate_expr_for_instance(inst.value)
             "result = Map.put(result, :#{name}, #{expr})"
 
-          inst.pos != nil and inst.type != nil ->
-            # Parse instance: seek to position and parse
+          inst.pos != nil ->
             pos_expr = translate_expr_for_instance(inst.pos)
             compile_parse_instance(name, inst, pos_expr, endian, type_registry, spec)
 
           inst.type != nil and inst.size != nil ->
-            # Sized parse instance
             size_expr = translate_expr_for_instance(inst.size)
             compile_sized_parse_instance(name, inst, size_expr, endian, type_registry, spec)
 
+          inst.type != nil and inst.size_eos == true ->
+            # Type with size-eos: parse from current data
+            type_mod = resolve_type_module(inst.type, type_registry, spec)
+            """
+            {inst_val, _} = #{type_mod}.parse(root_data, result)
+            result = Map.put(result, :#{name}, inst_val)
+            """
+            |> String.trim()
+
           true ->
             nil
+        end
+
+        # Wrap in conditional if needed
+        if code != nil and inst.if_expr != nil do
+          condition = translate_expr_for_instance(inst.if_expr)
+          """
+          result = if #{condition} do
+            #{code}
+            result
+          else
+            Map.put(result, :#{name}, nil)
+          end
+          """
+          |> String.trim()
+        else
+          code
         end
       end)
       |> Enum.reject(&is_nil/1)
@@ -430,29 +666,100 @@ defmodule Ksc.Compiler.ElixirCompiler do
   end
 
   defp compile_parse_instance(name, inst, pos_expr, endian, type_registry, spec) do
-    {_match, type_info} = type_to_pattern(inst.type, endian, %AttrSpec{size: inst.size, size_eos: inst.size_eos}, type_registry, spec)
+    # Determine how much to read
+    data_expr = if inst.size != nil do
+      size_expr = translate_expr_for_instance(inst.size)
+      "binary_part(root_data, #{pos_expr}, #{size_expr})"
+    else
+      "binary_part(root_data, #{pos_expr}, byte_size(root_data) - #{pos_expr})"
+    end
 
-    case type_info do
-      :user_type ->
-        type_mod = resolve_type_module(inst.type, type_registry, spec)
-        """
-        inst_data = binary_part(root_data, #{pos_expr}, byte_size(root_data) - #{pos_expr})
-        {inst_val, _} = #{type_mod}.parse(inst_data, root_data)
-        result = Map.put(result, :#{name}, inst_val)
-        """
-        |> String.trim()
+    if inst.type == nil do
+      # No type - just read bytes
+      """
+      inst_val = #{data_expr}
+      result = Map.put(result, :#{name}, inst_val)
+      """
+      |> String.trim()
+    else
+      {_match, type_info} = type_to_pattern(inst.type, endian, %AttrSpec{size: inst.size, size_eos: inst.size_eos}, type_registry, spec)
 
-      :primitive ->
-        {match, _} = type_to_pattern(inst.type, endian, %AttrSpec{}, type_registry, spec)
-        """
-        inst_data = binary_part(root_data, #{pos_expr}, byte_size(root_data) - #{pos_expr})
-        <<inst_val::#{match}, _::binary>> = inst_data
-        result = Map.put(result, :#{name}, inst_val)
-        """
-        |> String.trim()
+      case type_info do
+        :user_type ->
+          type_mod = resolve_type_module(inst.type, type_registry, spec)
+          if has_instances_for_type?(inst.type, spec) do
+            """
+            inst_data = #{data_expr}
+            {inst_val, _} = #{type_mod}.parse(inst_data, result)
+            inst_val = #{type_mod}.resolve_instances(inst_val, inst_data)
+            result = Map.put(result, :#{name}, inst_val)
+            """
+            |> String.trim()
+          else
+            """
+            inst_data = #{data_expr}
+            {inst_val, _} = #{type_mod}.parse(inst_data, result)
+            result = Map.put(result, :#{name}, inst_val)
+            """
+            |> String.trim()
+          end
 
-      _ ->
-        "result = Map.put(result, :#{name}, nil)"
+        :primitive ->
+          {match, _} = type_to_pattern(inst.type, endian, %AttrSpec{}, type_registry, spec)
+          """
+          inst_data = #{data_expr}
+          <<inst_val::#{match}, _::binary>> = inst_data
+          #{maybe_wrap_enum_inst(inst, "inst_val")}
+          result = Map.put(result, :#{name}, inst_val)
+          """
+          |> String.trim()
+
+        :str ->
+          """
+          inst_val = #{data_expr}
+          result = Map.put(result, :#{name}, inst_val)
+          """
+          |> String.trim()
+
+        :str_eos ->
+          """
+          inst_val = #{data_expr}
+          result = Map.put(result, :#{name}, inst_val)
+          """
+          |> String.trim()
+
+        :bytes ->
+          """
+          inst_val = #{data_expr}
+          result = Map.put(result, :#{name}, inst_val)
+          """
+          |> String.trim()
+
+        _ ->
+          """
+          inst_val = #{data_expr}
+          result = Map.put(result, :#{name}, inst_val)
+          """
+          |> String.trim()
+      end
+    end
+  end
+
+  defp has_instances_for_type?(type_name, spec) when is_binary(type_name) do
+    case Map.get(spec.types, type_name) do
+      %ClassSpec{instances: instances} when map_size(instances) > 0 -> true
+      _ -> false
+    end
+  end
+
+  defp maybe_wrap_enum_inst(%InstanceSpec{enum: nil}, _var), do: ""
+  defp maybe_wrap_enum_inst(%InstanceSpec{enum: enum_name}, var) do
+    if String.contains?(enum_name, "::") do
+      parts = String.split(enum_name, "::")
+      enum_id = List.last(parts)
+      "#{var} = Map.get(@enum_#{enum_id}, #{var}, #{var})"
+    else
+      "#{var} = Map.get(@enum_#{enum_name}, #{var}, #{var})"
     end
   end
 
@@ -465,19 +772,33 @@ defmodule Ksc.Compiler.ElixirCompiler do
         """
         inst_size = #{size_expr}
         <<inst_data::binary-size(inst_size), _::binary>> = root_data
-        {inst_val, _} = #{type_mod}.parse(inst_data, root_data)
+        {inst_val, _} = #{type_mod}.parse(inst_data, result)
+        result = Map.put(result, :#{name}, inst_val)
+        """
+        |> String.trim()
+
+      :primitive ->
+        {match, _} = type_to_pattern(inst.type, endian, %AttrSpec{}, type_registry, spec)
+        """
+        <<inst_val::#{match}, _::binary>> = root_data
         result = Map.put(result, :#{name}, inst_val)
         """
         |> String.trim()
 
       _ ->
-        "result = Map.put(result, :#{name}, nil)"
+        """
+        inst_size = #{size_expr}
+        <<inst_val::binary-size(inst_size), _::binary>> = root_data
+        result = Map.put(result, :#{name}, inst_val)
+        """
+        |> String.trim()
     end
   end
 
   defp type_to_pattern(nil, _endian, attr, _type_registry, _spec) do
     cond do
       attr.size != nil -> {"", :bytes}
+      attr.size_eos == true and Map.get(attr, :terminator) != nil -> {"", :bytes_eos}
       attr.size_eos == true -> {"", :bytes_eos}
       Map.get(attr, :terminator) != nil -> {"", :terminated}
       true -> {"binary", :raw}
@@ -485,14 +806,17 @@ defmodule Ksc.Compiler.ElixirCompiler do
   end
 
   defp type_to_pattern(type, endian, attr, type_registry, spec) when is_binary(type) do
+    # Strip type args for pattern matching
+    {base_type, _args} = parse_type_args(type)
+
     cond do
       # Bit types: b1 through b64
-      Regex.match?(~r/^b\d+$/, type) ->
-        bit_size = String.trim_leading(type, "b") |> String.to_integer()
+      Regex.match?(~r/^b\d+$/, base_type) ->
+        bit_size = String.trim_leading(base_type, "b") |> String.to_integer()
         {"", {:bit, bit_size}}
 
       true ->
-        case type do
+        case base_type do
           "u1" -> {"unsigned-integer-size(8)", :primitive}
           "s1" -> {"signed-integer-size(8)", :primitive}
           "u2" -> {"unsigned-integer-#{endian_str(endian)}-size(16)", :primitive}
@@ -543,11 +867,20 @@ defmodule Ksc.Compiler.ElixirCompiler do
   end
 
   defp is_user_type?(type, type_registry, spec) do
+    # Strip args from type reference
+    {base_type, _args} = parse_type_args(type)
     # Handle :: path separator (e.g., "subtype_a::subtype_cc")
-    if String.contains?(type, "::") do
+    if String.contains?(base_type, "::") do
       true
     else
-      Map.has_key?(type_registry, type) or Map.has_key?(spec.types, type)
+      # Check local types, type registry, and imports
+      Map.has_key?(type_registry, base_type) or
+        Map.has_key?(spec.types, base_type) or
+        base_type in (spec.imports || []) or
+        Enum.any?(spec.imports || [], fn imp ->
+          # Import could be "common/vlq" but type ref is just "vlq_base128_le"
+          String.ends_with?(imp, "/#{base_type}") or imp == base_type
+        end)
     end
   end
 
@@ -580,18 +913,17 @@ defmodule Ksc.Compiler.ElixirCompiler do
     # Handle cross-type enum references like "container1::animal"
     if String.contains?(enum_name, "::") do
       parts = String.split(enum_name, "::")
-      # The last part is the enum name, earlier parts are type paths
-      _type_path = Enum.slice(parts, 0..-2//1) |> Enum.map(&Utils.to_module_name/1) |> Enum.join(".")
+      type_path = Enum.slice(parts, 0..-2//1) |> Enum.map(&Utils.to_module_name/1) |> Enum.join(".")
       enum_id = List.last(parts)
-      # For cross-type enums, we'd need the module reference, but since module attributes
-      # are compile-time only in their own module, we inline the lookup
-      code <> "\n#{var} = Map.get(@enum_#{enum_id}, #{var}, #{var})"
+      # Reference the enum in the specific type module
+      code <> "\n#{var} = Map.get(#{type_path}.enum_#{enum_id}(), #{var}, #{var})"
     else
       code <> "\n#{var} = Map.get(@enum_#{enum_name}, #{var}, #{var})"
     end
   end
 
   defp maybe_apply_byte_processing(code, %AttrSpec{} = attr, var) do
+    # KSY spec order: strip pad_right first, then apply terminator
     code =
       if attr.pad_right != nil do
         code <> "\n#{var} = Ksc.Stream.strip_pad_right(#{var}, #{attr.pad_right})"
@@ -599,12 +931,58 @@ defmodule Ksc.Compiler.ElixirCompiler do
         code
       end
 
-    if attr.terminator != nil do
-      code <> "\n#{var} = Ksc.Stream.terminate_at(#{var}, #{attr.terminator}, #{attr.include == true})"
-    else
-      code
+    code =
+      if attr.terminator != nil do
+        code <> "\n#{var} = Ksc.Stream.terminate_at(#{var}, #{attr.terminator}, #{attr.include == true})"
+      else
+        code
+      end
+
+    maybe_apply_process(code, attr, var)
+  end
+
+  defp maybe_apply_process(code, %AttrSpec{process: nil}, _var), do: code
+
+  defp maybe_apply_process(code, %AttrSpec{process: process}, var) when is_binary(process) do
+    cond do
+      # process: xor(key) where key is integer
+      Regex.match?(~r/^xor\(/, process) ->
+        arg = String.trim_leading(process, "xor(") |> String.trim_trailing(")")
+        # Check if the arg is a field reference or a literal
+        cond do
+          # Byte array literal like [0xec, 0xbb, ...]
+          String.starts_with?(arg, "[") ->
+            code <> "\n#{var} = Ksc.Stream.process_xor(#{var}, #{translate_expr(arg)})"
+          # Hex or int literal
+          String.starts_with?(arg, "0x") or Regex.match?(~r/^\d+$/, arg) ->
+            code <> "\n#{var} = Ksc.Stream.process_xor(#{var}, #{arg})"
+          true ->
+            # Field reference
+            code <> "\n#{var} = Ksc.Stream.process_xor(#{var}, #{translate_expr(arg)})"
+        end
+
+      process == "zlib" ->
+        code <> "\n#{var} = Ksc.Stream.process_zlib(#{var})"
+
+      Regex.match?(~r/^rotate_left\(/, process) ->
+        arg = String.trim_leading(process, "rotate_left(") |> String.trim_trailing(")")
+        code <> "\n#{var} = Ksc.Stream.process_rotate_left(#{var}, #{translate_expr(arg)})"
+
+      Regex.match?(~r/^rol\(/, process) ->
+        arg = String.trim_leading(process, "rol(") |> String.trim_trailing(")")
+        code <> "\n#{var} = Ksc.Stream.process_rotate_left(#{var}, #{translate_expr(arg)})"
+
+      Regex.match?(~r/^ror\(/, process) ->
+        arg = String.trim_leading(process, "ror(") |> String.trim_trailing(")")
+        code <> "\n#{var} = Ksc.Stream.process_rotate_left(#{var}, 8 - #{translate_expr(arg)})"
+
+      true ->
+        # Unknown process, just pass through
+        code
     end
   end
+
+  defp maybe_apply_process(code, _attr, _var), do: code
 
   defp compile_enums(enums) when map_size(enums) == 0, do: ""
 
@@ -614,7 +992,7 @@ defmodule Ksc.Compiler.ElixirCompiler do
         Enum.map(values, fn {k, v} -> "#{k} => :#{v}" end)
         |> Enum.join(", ")
 
-      "@enum_#{name} %{#{map_str}}"
+      "@enum_#{name} %{#{map_str}}\ndef enum_#{name}(), do: @enum_#{name}"
     end)
     |> Enum.join("\n")
   end
@@ -641,6 +1019,166 @@ defmodule Ksc.Compiler.ElixirCompiler do
   # repeat-until uses _ as the current item reference
   defp translate_expr_for_repeat_until(expr) when is_binary(expr) do
     Ksc.Expression.translate_for_repeat_until(escape_elixir_interpolation(expr))
+  end
+
+  defp collect_all_expressions(attrs) do
+    Enum.flat_map(attrs, fn %AttrSpec{} = a ->
+      [a.size, a.if_expr, a.repeat_expr, a.repeat_until] |> Enum.reject(&is_nil/1)
+    end)
+  end
+
+  defp insert_io_pos_updates(body) do
+    # Insert io_pos = io_size - byte_size(rest) before lines that use io_pos
+    lines = String.split(body, "\n")
+    Enum.flat_map(lines, fn line ->
+      if String.contains?(line, "io_pos") and not String.starts_with?(String.trim(line), "io_pos =") and not String.starts_with?(String.trim(line), "io_size =") do
+        ["io_pos = io_size - byte_size(rest)", line]
+      else
+        [line]
+      end
+    end)
+    |> Enum.join("\n")
+  end
+
+  # Parse type reference with optional arguments: "my_type(arg1, arg2)" -> {"my_type", ["arg1", "arg2"]}
+  defp parse_type_args(type) when is_binary(type) do
+    case Regex.run(~r/^([a-zA-Z_][a-zA-Z0-9_:]*)\((.+)\)$/, type) do
+      [_, base_type, args_str] ->
+        args = split_args(args_str)
+        {base_type, args}
+      nil ->
+        {type, []}
+    end
+  end
+  defp parse_type_args(type), do: {type, []}
+
+  defp split_args(str) do
+    # Split on commas outside of parentheses
+    chars = String.graphemes(str)
+    {args, current, _depth} = Enum.reduce(chars, {[], "", 0}, fn ch, {args, current, depth} ->
+      case ch do
+        "(" -> {args, current <> ch, depth + 1}
+        ")" -> {args, current <> ch, depth - 1}
+        "," when depth == 0 -> {args ++ [String.trim(current)], "", 0}
+        _ -> {args, current <> ch, depth}
+      end
+    end)
+    args ++ [String.trim(current)]
+  end
+
+  # Build processing steps for data variable (pad, term, process)
+  defp build_data_processing(%AttrSpec{} = attr, data_var) do
+    steps = []
+    steps = if attr.pad_right != nil do
+      steps ++ ["#{data_var} = Ksc.Stream.strip_pad_right(#{data_var}, #{attr.pad_right})"]
+    else
+      steps
+    end
+    steps = if attr.terminator != nil do
+      steps ++ ["#{data_var} = Ksc.Stream.terminate_at(#{data_var}, #{attr.terminator}, #{attr.include == true})"]
+    else
+      steps
+    end
+    steps = if attr.process != nil do
+      steps ++ [build_process_step(attr.process, data_var)]
+    else
+      steps
+    end
+    steps
+  end
+
+  defp build_process_step(process, var) when is_binary(process) do
+    cond do
+      Regex.match?(~r/^xor\(/, process) ->
+        arg = String.trim_leading(process, "xor(") |> String.trim_trailing(")")
+        cond do
+          String.starts_with?(arg, "[") ->
+            "#{var} = Ksc.Stream.process_xor(#{var}, #{translate_expr(arg)})"
+          String.starts_with?(arg, "0x") or Regex.match?(~r/^\d+$/, arg) ->
+            "#{var} = Ksc.Stream.process_xor(#{var}, #{arg})"
+          true ->
+            "#{var} = Ksc.Stream.process_xor(#{var}, #{translate_expr(arg)})"
+        end
+      process == "zlib" ->
+        "#{var} = Ksc.Stream.process_zlib(#{var})"
+      Regex.match?(~r/^rotate_left\(/, process) ->
+        arg = String.trim_leading(process, "rotate_left(") |> String.trim_trailing(")")
+        "#{var} = Ksc.Stream.process_rotate_left(#{var}, #{translate_expr(arg)})"
+      Regex.match?(~r/^rol\(/, process) ->
+        arg = String.trim_leading(process, "rol(") |> String.trim_trailing(")")
+        "#{var} = Ksc.Stream.process_rotate_left(#{var}, #{translate_expr(arg)})"
+      Regex.match?(~r/^ror\(/, process) ->
+        arg = String.trim_leading(process, "ror(") |> String.trim_trailing(")")
+        "#{var} = Ksc.Stream.process_rotate_left(#{var}, 8 - #{translate_expr(arg)})"
+      true ->
+        "# unknown process: #{process}"
+    end
+  end
+
+  defp topological_sort_instances(instances) do
+    names = Map.keys(instances)
+    # Build dependency graph
+    deps = Map.new(instances, fn {name, inst} ->
+      expr_text = Enum.join([
+        inst.value || "",
+        inst.if_expr || "",
+        inst.pos || "",
+        inst.size || "",
+        inst.io || ""
+      ], " ")
+      referenced = Enum.filter(names, fn other ->
+        other != name and String.contains?(expr_text, other)
+      end)
+      {name, referenced}
+    end)
+
+    # Kahn's algorithm
+    sorted = topological_sort_kahn(names, deps)
+    Enum.map(sorted, fn name -> {name, instances[name]} end)
+  end
+
+  defp topological_sort_kahn(names, deps) do
+    # in_degree: count how many deps each node has
+    in_degree = Map.new(names, fn n -> {n, length(Map.get(deps, n, []))} end)
+    queue = Enum.filter(names, fn n -> Map.get(in_degree, n, 0) == 0 end) |> :queue.from_list()
+    do_topological_sort(queue, deps, in_degree, names, [])
+  end
+
+  defp do_topological_sort(queue, deps, in_degree, all_names, result) do
+    case :queue.out(queue) do
+      {:empty, _} ->
+        # Add any remaining nodes (cycle handling)
+        remaining = all_names -- result
+        result ++ remaining
+
+      {{:value, node}, queue} ->
+        result = result ++ [node]
+        # Find nodes that depend on this one
+        dependents = Enum.filter(all_names, fn n ->
+          n not in result and node in Map.get(deps, n, [])
+        end)
+        {queue, in_degree} = Enum.reduce(dependents, {queue, in_degree}, fn dep, {q, id} ->
+          new_degree = Map.get(id, dep, 0) - 1
+          id = Map.put(id, dep, new_degree)
+          if new_degree == 0 do
+            {:queue.in(dep, q), id}
+          else
+            {q, id}
+          end
+        end)
+        do_topological_sort(queue, deps, in_degree, all_names, result)
+    end
+  end
+
+  defp resolve_encoding(%AttrSpec{encoding: enc}, _spec) when is_binary(enc) and enc != "", do: enc
+  defp resolve_encoding(_attr, %ClassSpec{encoding: enc}) when is_binary(enc) and enc != "", do: enc
+  defp resolve_encoding(_, _), do: nil
+
+  defp maybe_apply_encoding(code, nil, _var), do: code
+  defp maybe_apply_encoding(code, "UTF-8", _var), do: code
+  defp maybe_apply_encoding(code, "ASCII", _var), do: code
+  defp maybe_apply_encoding(code, encoding, var) do
+    code <> "\n#{var} = Ksc.Stream.decode_string(#{var}, \"#{encoding}\")"
   end
 
   # Escape #{...} in string literals so Elixir doesn't try to interpolate them.

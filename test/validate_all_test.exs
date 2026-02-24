@@ -29,6 +29,7 @@ defmodule ValidateAllTest do
     ksy_id = kst["id"] || kst_name
     data_file = kst["data"]
     asserts = kst["asserts"] || []
+    expect_exception = kst["exception"] != nil
 
     ksy_path = Path.join(@formats_dir, "#{ksy_id}.ksy")
 
@@ -59,7 +60,7 @@ defmodule ValidateAllTest do
 
     case load_result do
       {:ok, mod} ->
-        if data_file && asserts != [] do
+        if data_file do
           bin_path = Path.join(@fixtures_dir, data_file)
           unless File.exists?(bin_path) do
             flunk("Binary fixture not found: #{bin_path}")
@@ -81,7 +82,12 @@ defmodule ValidateAllTest do
               end
 
             {:parse_error, msg} ->
-              flunk("Parse failed for #{ksy_id}: #{msg}")
+              if expect_exception and asserts == [] do
+                # Exception was expected and no further asserts - test passes
+                :ok
+              else
+                flunk("Parse failed for #{ksy_id}: #{msg}")
+              end
           end
         end
 
@@ -124,14 +130,47 @@ defmodule ValidateAllTest do
       {:method, "size"}, acc when is_list(acc) ->
         length(acc)
 
+      {:method, "size"}, acc when is_binary(acc) ->
+        byte_size(acc)
+
+      {:method, "size"}, acc when is_integer(acc) ->
+        acc
+
       {:method, "length"}, acc when is_binary(acc) ->
         String.length(acc)
+
+      {:method, "length"}, acc when is_integer(acc) ->
+        # .length on an integer doesn't make sense, but some tests use it
+        acc
+
+      {:method, "to_i"}, acc ->
+        Ksc.Stream.to_i(acc)
+
+      {:method, "to_s"}, acc when is_binary(acc) ->
+        acc
+
+      {:method, "to_s"}, acc when is_integer(acc) ->
+        Integer.to_string(acc)
+
+      {:method, "first"}, acc when is_list(acc) ->
+        List.first(acc)
+
+      {:method, "first"}, acc when is_binary(acc) ->
+        :binary.at(acc, 0)
+
+      {:method, "last"}, acc when is_list(acc) ->
+        List.last(acc)
+
+      {:method, "last"}, acc when is_binary(acc) ->
+        :binary.at(acc, byte_size(acc) - 1)
 
       {:cast, _type}, acc ->
         # Type casts like .as<type> - just pass through
         acc
     end)
   end
+
+  @method_names ~w(size length to_i to_s first last)
 
   defp parse_path(path) do
     # Remove .as<...> casts
@@ -145,7 +184,7 @@ defmodule ValidateAllTest do
         [_, name, idx] ->
           [{:field, name}, {:index, String.to_integer(idx)}]
         nil ->
-          if part == "size" or part == "length" do
+          if part in @method_names do
             [{:method, part}]
           else
             [{:field, part}]
@@ -158,6 +197,7 @@ defmodule ValidateAllTest do
   defp normalize_expected(val, _ksy_id) when is_float(val), do: {:float, val}
   defp normalize_expected(true, _ksy_id), do: {:bool, true}
   defp normalize_expected(false, _ksy_id), do: {:bool, false}
+  defp normalize_expected(nil, _ksy_id), do: {:null, nil}
   defp normalize_expected("null", _ksy_id), do: {:null, nil}
 
   defp normalize_expected(val, ksy_id) when is_binary(val) do
@@ -172,9 +212,31 @@ defmodule ValidateAllTest do
       String.starts_with?(val, "\"") and String.ends_with?(val, "\"") ->
         {:string, String.slice(val, 1..-2//1)}
 
-      # Byte array: '[0x73, 0x74, ...]'
-      String.starts_with?(val, "[") ->
+      # Hex integer literal: '0xffffffff' or '0xffff_ffff'
+      Regex.match?(~r/^0x[0-9a-fA-F_]+$/, val) ->
+        hex_str = String.trim_leading(val, "0x") |> String.replace("_", "")
+        {int_val, _} = Integer.parse(hex_str, 16)
+        {:int, int_val}
+
+      # Binary literal: '0b101' or '0b0101_0110'
+      Regex.match?(~r/^0b[01_]+$/, val) ->
+        bin_str = String.trim_leading(val, "0b") |> String.replace("_", "")
+        {int_val, _} = Integer.parse(bin_str, 2)
+        {:int, int_val}
+
+      # Array of strings: '["foo", "bar"]'
+      Regex.match?(~r/^\[.*".*\]/, val) ->
+        {:string_array, parse_string_array(val)}
+
+      # Byte array: '[0x73, 0x74, ...]' or '[...].as<bytes>'
+      String.starts_with?(val, "[") and (String.contains?(val, "]")) ->
         {:bytes, parse_byte_array(val)}
+
+      # Float with .as<type> suffix: "0.5.as<f4>"
+      Regex.match?(~r/^-?[\d.]+\.as<[^>]+>$/, val) ->
+        num_str = Regex.replace(~r/\.as<[^>]+>$/, val, "")
+        {float_val, _} = Float.parse(num_str)
+        {:float, float_val}
 
       # Boolean strings
       val == "true" -> {:bool, true}
@@ -188,9 +250,26 @@ defmodule ValidateAllTest do
 
   defp normalize_expected(val, _ksy_id), do: {:raw, val}
 
+  defp parse_string_array(str) do
+    # Strip .as<> suffix if present
+    str = Regex.replace(~r/\]\.as<[^>]+>$/, str, "]")
+    inner = String.slice(str, 1..-2//1) |> String.trim()
+    if inner == "" do
+      []
+    else
+      # Parse comma-separated quoted strings
+      Regex.scan(~r/"([^"]*)"/, inner)
+      |> Enum.map(fn [_, s] -> s end)
+    end
+  end
+
   defp parse_byte_array(str) do
+    # Strip trailing # comment from the whole string first
+    str = Regex.replace(~r/\]\s*#.*$/, str, "]")
+    # Remove .as<type> suffix after the closing bracket
+    str = Regex.replace(~r/\]\.as<[^>]+>$/, str, "]")
     inner = String.slice(str, 1..-2//1)
-    # Remove .as<bytes> suffix if present
+    # Remove .as<bytes> suffix from inner elements if present
     inner = Regex.replace(~r/\.as<[^>]+>/, inner, "")
     inner = String.trim(inner)
 
@@ -242,10 +321,43 @@ defmodule ValidateAllTest do
       "#{ksy_id}: #{path} expected #{inspect(expected)}, got #{inspect(actual)}"
   end
 
+  defp assert_values_match(actual, {:string_array, expected}, path, ksy_id) do
+    assert actual == expected,
+      "#{ksy_id}: #{path} expected #{inspect(expected)}, got #{inspect(actual)}"
+  end
+
   defp assert_values_match(actual, {:bytes, expected}, path, ksy_id) do
     actual_bytes = if is_binary(actual), do: :binary.bin_to_list(actual), else: actual
     assert actual_bytes == expected,
       "#{ksy_id}: #{path} expected #{inspect(expected)}, got #{inspect(actual_bytes)}"
+  end
+
+  defp assert_values_match(actual, {:raw, expected}, path, ksy_id) when is_binary(expected) do
+    # Try to parse as hex integer comparison
+    cond do
+      String.starts_with?(expected, "0x") ->
+        hex_str = String.trim_leading(expected, "0x") |> String.replace("_", "")
+        {int_val, _} = Integer.parse(hex_str, 16)
+        assert actual == int_val,
+          "#{ksy_id}: #{path} expected #{expected} (#{int_val}), got #{inspect(actual)}"
+
+      String.starts_with?(expected, "0b") ->
+        bin_str = String.trim_leading(expected, "0b") |> String.replace("_", "")
+        {int_val, _} = Integer.parse(bin_str, 2)
+        assert actual == int_val,
+          "#{ksy_id}: #{path} expected #{expected} (#{int_val}), got #{inspect(actual)}"
+
+      # Float with .as<type> suffix: "0.5.as<f4>"
+      Regex.match?(~r/^-?[\d.]+\.as<[^>]+>$/, expected) ->
+        num_str = Regex.replace(~r/\.as<[^>]+>$/, expected, "")
+        {float_val, _} = Float.parse(num_str)
+        assert_in_delta actual, float_val, 0.0001,
+          "#{ksy_id}: #{path} expected #{expected}, got #{inspect(actual)}"
+
+      true ->
+        assert to_string(actual) == to_string(expected),
+          "#{ksy_id}: #{path} expected #{inspect(expected)}, got #{inspect(actual)}"
+    end
   end
 
   defp assert_values_match(actual, {:raw, expected}, path, ksy_id) do

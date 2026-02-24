@@ -9,6 +9,8 @@ defmodule Ksc.Format.ClassSpec do
     seq: [],
     types: %{},
     instances: %{},
-    enums: %{}
+    enums: %{},
+    imports: [],
+    params: []
   ]
 end
