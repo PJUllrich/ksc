@@ -87,7 +87,7 @@ defmodule Ksc.Stream do
   end
 
   defp repeat_eos_bits_acc({_, 0, <<>>}, _num_bits, _bit_fn, acc), do: {Enum.reverse(acc), <<>>}
-  defp repeat_eos_bits_acc({bits_acc, bits_left, data} = state, num_bits, bit_fn, acc) do
+  defp repeat_eos_bits_acc({_bits_acc, bits_left, data} = state, num_bits, bit_fn, acc) do
     # Check if we have enough bits left to read
     total_bits = bits_left + byte_size(data) * 8
     if total_bits < num_bits do

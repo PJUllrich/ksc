@@ -37,6 +37,9 @@ defmodule ValidateAllTest do
       flunk("KSY file not found: #{ksy_path}")
     end
 
+    # Pre-compile opaque type dependencies if needed
+    ensure_opaque_types_loaded(ksy_path)
+
     # Phase 1: Compile
     {compile_result, source} = try do
       {:ok, src} = Ksc.compile(ksy_path)
@@ -93,6 +96,34 @@ defmodule ValidateAllTest do
 
       {:load_error, msg} ->
         flunk("Load failed for #{ksy_id}: #{msg}")
+    end
+  end
+
+  # Pre-compile opaque type dependencies so they're available at parse time
+  defp ensure_opaque_types_loaded(ksy_path) do
+    ksy = Ksc.Yaml.parse_file(ksy_path)
+    meta = Map.get(ksy, "meta", %{}) || %{}
+    if Map.get(meta, "ks-opaque-types") == true do
+      formats_dir = Path.dirname(ksy_path)
+      known_types = Map.keys(Map.get(ksy, "types", %{}))
+      seq = Map.get(ksy, "seq", []) || []
+      for attr <- seq,
+          type = Map.get(attr, "type"),
+          is_binary(type),
+          type not in known_types,
+          type not in ~w(u1 u2 u4 u8 s1 s2 s4 s8 f4 f8 str strz) do
+        dep_ksy = Path.join(formats_dir, "#{type}.ksy")
+        if File.exists?(dep_ksy) do
+          mod_name = type |> Macro.camelize()
+          unless Code.ensure_loaded?(String.to_atom("Elixir.#{mod_name}")) do
+            try do
+              Ksc.compile_and_load(dep_ksy)
+            rescue
+              _ -> :ok
+            end
+          end
+        end
+      end
     end
   end
 
@@ -194,7 +225,7 @@ defmodule ValidateAllTest do
   defp normalize_expected(nil, _ksy_id), do: {:null, nil}
   defp normalize_expected("null", _ksy_id), do: {:null, nil}
 
-  defp normalize_expected(val, ksy_id) when is_binary(val) do
+  defp normalize_expected(val, _ksy_id) when is_binary(val) do
     cond do
       # Enum reference: "module::enum_name::value"
       String.contains?(val, "::") ->

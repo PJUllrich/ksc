@@ -26,7 +26,8 @@ defmodule Ksc.Parser do
       instances: parse_instances(Map.get(map, "instances", %{})),
       enums: parse_enums(Map.get(map, "enums", %{})),
       imports: Map.get(meta, "imports", []) || [],
-      params: parse_params(Map.get(map, "params"))
+      params: parse_params(Map.get(map, "params")),
+      ks_debug: Map.get(meta, "ks-debug", false) == true
     }
   end
 

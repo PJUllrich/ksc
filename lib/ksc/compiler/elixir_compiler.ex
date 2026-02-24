@@ -168,14 +168,10 @@ defmodule Ksc.Compiler.ElixirCompiler do
     end # has_params else
   end
 
-  defp compute_eager_instances(%ClassSpec{} = spec, endian, type_registry) do
+  defp compute_eager_instances(%ClassSpec{} = spec, _endian, _type_registry) do
     if spec.seq == [] do
       []
     else
-      parse_endian = case endian do
-        {:switch, _, _} -> :dynamic
-        other -> other
-      end
       {seq_with_ids, _} = Enum.reduce(spec.seq, {[], 0}, fn attr, {acc, anon_idx} ->
         if attr.id == nil or attr.id == "" do
           {acc ++ [%{attr | id: "_anon_#{anon_idx}"}], anon_idx + 1}
@@ -208,12 +204,6 @@ defmodule Ksc.Compiler.ElixirCompiler do
     end
 
     if spec.seq == [] do
-      # Check if instances reference _parent
-      all_inst_exprs = Enum.flat_map(spec.instances, fn {_, inst} ->
-        [inst.value || "", inst.pos || "", inst.size || "", inst.if_expr || "", inst.io || ""]
-      end) |> Enum.join(" ")
-      needs_parent = String.contains?(all_inst_exprs, "_parent")
-
       if has_params do
         args = Enum.join(["data", "root_", "parent_"] ++ param_names, ", ")
         param_map = Enum.map(params, fn p -> "#{p.id}: var_#{p.id}" end) |> Enum.join(", ")
@@ -246,12 +236,6 @@ defmodule Ksc.Compiler.ElixirCompiler do
       field_entries = Enum.map(field_names, fn name -> "#{name}: var_#{name}" end)
       eager_entries = Enum.map(eager_instances, fn name -> "#{name}: var_#{name}" end)
 
-      # Check if instances reference _parent or _root - if so, store them in result
-      inst_all_exprs = Enum.flat_map(spec.instances, fn {_, inst} ->
-        [inst.value || "", inst.pos || "", inst.if_expr || "", inst.io || "", inst.size || ""]
-      end) |> Enum.join(" ")
-      inst_needs_parent = String.contains?(inst_all_exprs, "_parent")
-      inst_needs_root = String.contains?(inst_all_exprs, "_root")
       # Check if non-eager instances reference _io.pos (need to track parse position)
       non_eager_inst_exprs = Enum.flat_map(spec.instances, fn {name, inst} ->
         if name in eager_instances, do: [], else: [inst.pos || "", inst.value || "", inst.size || "", inst.if_expr || ""]
@@ -801,13 +785,31 @@ defmodule Ksc.Compiler.ElixirCompiler do
       ""
     end
 
-    """
-    {#{var}, rest} = Enum.reduce(Enum.with_index(1..max(#{count}, 0)//1), {[], rest}, fn {_, var__index}, {acc, rest} ->
-      #{update_parent}#{Utils.indent(inner_code, 1)}
-      {acc ++ [item], rest}
-    end)
-    """
-    |> String.trim()
+    if spec.ks_debug do
+      """
+      {#{var}, rest} = try do
+        Enum.reduce(Enum.with_index(1..max(#{count}, 0)//1), {[], rest}, fn {_, var__index}, {acc, rest} ->
+          try do
+            #{update_parent}#{Utils.indent(inner_code, 2)}
+            {acc ++ [item], rest}
+          rescue
+            _ -> throw({:partial_array, acc, rest})
+          end
+        end)
+      catch
+        {:partial_array, partial, partial_rest} -> {partial, partial_rest}
+      end
+      """
+      |> String.trim()
+    else
+      """
+      {#{var}, rest} = Enum.reduce(Enum.with_index(1..max(#{count}, 0)//1), {[], rest}, fn {_, var__index}, {acc, rest} ->
+        #{update_parent}#{Utils.indent(inner_code, 1)}
+        {acc ++ [item], rest}
+      end)
+      """
+      |> String.trim()
+    end
   end
 
   defp compile_repeat_eos(%AttrSpec{} = attr, endian, var, type_registry, spec) do
@@ -992,7 +994,7 @@ defmodule Ksc.Compiler.ElixirCompiler do
   defp translate_case_key(key) when is_integer(key), do: Integer.to_string(key)
   defp translate_case_key(key), do: to_string(key)
 
-  defp compile_instances(instances, endian, type_registry, spec, eager_instances \\ []) do
+  defp compile_instances(instances, endian, type_registry, spec, eager_instances) do
     if map_size(instances) == 0 do
       # Always generate resolve_instances (no-op for types without instances)
       ["def resolve_instances(result, _root_data), do: result"]
@@ -1002,7 +1004,7 @@ defmodule Ksc.Compiler.ElixirCompiler do
     end
   end
 
-  defp compile_resolve_instances(instances, endian, type_registry, spec, eager_instances \\ []) do
+  defp compile_resolve_instances(instances, endian, type_registry, spec, eager_instances) do
     # Convert switch endian to :dynamic for instance compilation
     effective_endian = case endian do
       {:switch, _, _} -> :dynamic
@@ -1314,7 +1316,7 @@ defmodule Ksc.Compiler.ElixirCompiler do
     end
   end
 
-  defp compile_switch_instance(name, inst, data_expr, io_source, endian, type_registry, spec) do
+  defp compile_switch_instance(name, inst, data_expr, _io_source, endian, type_registry, spec) do
     %{"switch-on" => switch_expr, "cases" => cases} = inst.type
     switch_val = translate_expr_for_instance(switch_expr)
 
@@ -1564,15 +1566,7 @@ defmodule Ksc.Compiler.ElixirCompiler do
   end
 
   defp translate_endian_case_key("_"), do: "_"
-  defp translate_endian_case_key(key) do
-    # Handle byte array literals like '[0x49, 0x49]'
-    key = String.trim(key)
-    if String.starts_with?(key, "[") and String.ends_with?(key, "]") do
-      translate_expr(key)
-    else
-      translate_expr(key)
-    end
-  end
+  defp translate_endian_case_key(key), do: translate_expr(String.trim(key))
 
   defp endian_str(:le), do: "little"
   defp endian_str(:be), do: "big"
@@ -1617,56 +1611,31 @@ defmodule Ksc.Compiler.ElixirCompiler do
 
   defp maybe_apply_process(code, %AttrSpec{process: process}, var) when is_binary(process) do
     cond do
-      # process: xor(key) where key is integer
       Regex.match?(~r/^xor\(/, process) ->
-        arg = extract_process_arg(process, "xor")
-        # Check if the arg is a field reference or a literal
-        cond do
-          # Byte array literal like [0xec, 0xbb, ...]
-          String.starts_with?(arg, "[") ->
-            code <> "\n#{var} = Ksc.Stream.process_xor(#{var}, #{translate_expr(arg)})"
-          # Pure hex or int literal (no spaces/operators)
-          Regex.match?(~r/^0x[0-9a-fA-F]+$/, arg) or Regex.match?(~r/^\d+$/, arg) ->
-            code <> "\n#{var} = Ksc.Stream.process_xor(#{var}, #{arg})"
-          true ->
-            # Expression
-            code <> "\n#{var} = Ksc.Stream.process_xor(#{var}, #{translate_expr(arg)})"
-        end
+        arg = extract_process_arg(process)
+        code <> "\n#{var} = Ksc.Stream.process_xor(#{var}, #{translate_expr(arg)})"
 
       process == "zlib" ->
         code <> "\n#{var} = Ksc.Stream.process_zlib(#{var})"
 
       Regex.match?(~r/^rotate_left\(/, process) ->
-        arg = extract_process_arg(process, "rotate_left")
+        arg = extract_process_arg(process)
         code <> "\n#{var} = Ksc.Stream.process_rotate_left(#{var}, #{translate_expr(arg)})"
 
       Regex.match?(~r/^rol\(/, process) ->
-        arg = extract_process_arg(process, "rol")
+        arg = extract_process_arg(process)
         code <> "\n#{var} = Ksc.Stream.process_rotate_left(#{var}, #{translate_expr(arg)})"
 
       Regex.match?(~r/^ror\(/, process) ->
-        arg = extract_process_arg(process, "ror")
+        arg = extract_process_arg(process)
         code <> "\n#{var} = Ksc.Stream.process_rotate_left(#{var}, 8 - #{translate_expr(arg)})"
 
       true ->
-        # Unknown process, just pass through
         code
     end
   end
 
   defp maybe_apply_process(code, _attr, _var), do: code
-
-  # Extract the argument from "funcname(arg)" respecting nested parens
-  defp extract_process_arg(process, func_name) do
-    prefix_len = String.length(func_name) + 1  # "funcname("
-    inner = String.slice(process, prefix_len..-1//1)
-    # Strip the final closing paren that matches the opening one
-    if String.ends_with?(inner, ")") do
-      String.slice(inner, 0..-2//1)
-    else
-      inner
-    end
-  end
 
   defp compile_enums(enums) when map_size(enums) == 0 do
     "@kaitai_enum_reverse %{}"
@@ -1961,7 +1930,7 @@ defmodule Ksc.Compiler.ElixirCompiler do
     # Use a simple approach: search for the var_name pattern in each field_parse entry
     field_parses
     |> Enum.with_index()
-    |> Enum.flat_map(fn {parse_code, fp_idx} ->
+    |> Enum.flat_map(fn {parse_code, _fp_idx} ->
       # Find insertions that should go before this field_parse entry
       prefix = Enum.filter(insertions, fn {seq_idx, _code} ->
         # Check if this field_parse contains the var for the seq field at seq_idx

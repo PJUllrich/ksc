@@ -11,6 +11,7 @@ defmodule Ksc.Format.ClassSpec do
     instances: %{},
     enums: %{},
     imports: [],
-    params: []
+    params: [],
+    ks_debug: false
   ]
 end
