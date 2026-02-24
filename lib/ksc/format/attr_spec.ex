@@ -18,6 +18,7 @@ defmodule Ksc.Format.AttrSpec do
     :include,
     :process,
     :consume,
-    :eos_error
+    :eos_error,
+    :parent
   ]
 end

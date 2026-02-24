@@ -32,6 +32,12 @@ defmodule Ksc.Parser do
 
   defp parse_endian("le"), do: :le
   defp parse_endian("be"), do: :be
+  defp parse_endian(%{"switch-on" => switch_on, "cases" => cases}) do
+    parsed_cases = Enum.map(cases || %{}, fn {k, v} ->
+      {to_string(k), parse_endian(v)}
+    end) |> Map.new()
+    {:switch, to_string(switch_on), parsed_cases}
+  end
   defp parse_endian(_), do: nil
 
   defp parse_seq(nil), do: []
@@ -58,7 +64,8 @@ defmodule Ksc.Parser do
       include: Map.get(map, "include"),
       process: Map.get(map, "process"),
       consume: Map.get(map, "consume"),
-      eos_error: Map.get(map, "eos-error")
+      eos_error: Map.get(map, "eos-error"),
+      parent: Map.get(map, "parent")
     }
   end
 

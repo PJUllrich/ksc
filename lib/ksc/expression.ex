@@ -75,6 +75,10 @@ defmodule Ksc.Expression do
         inner = String.slice(expr, 1..-2//1)
         "(#{do_translate(inner, mode)})"
 
+      # f-string (formatted string): f"abc={expr}" -> "abc=#{expr}"
+      String.starts_with?(expr, "f\"") and String.ends_with?(expr, "\"") ->
+        translate_fstring(expr, mode)
+
       # String literal
       String.starts_with?(expr, "\"") and String.ends_with?(expr, "\"") ->
         expr
@@ -104,6 +108,14 @@ defmodule Ksc.Expression do
       # _is_le special variable for default_endian_expr
       expr == "_is_le" ->
         "var__is_le"
+
+      # sizeof<Type> - compile-time type size
+      String.starts_with?(expr, "sizeof<") and String.ends_with?(expr, ">") ->
+        type_name = String.slice(expr, 7..-2//1)
+        mod_name = type_name |> String.split("::") |> Enum.map(fn part ->
+          part |> String.split("_") |> Enum.map(&String.capitalize/1) |> Enum.join()
+        end) |> Enum.join(".")
+        "#{mod_name}.__sizeof__()"
 
       # Method/field access: expr.method
       has_dot_access?(expr) ->
@@ -152,15 +164,57 @@ defmodule Ksc.Expression do
     end
   end
 
+  defp translate_fstring(expr, mode) do
+    # f"text{expr}text" -> "text#{translated_expr}text"
+    # Strip leading f and outer quotes
+    inner = String.slice(expr, 2..-2//1)
+    # Escape backslashes so \n stays literal in Elixir string
+    inner = String.replace(inner, "\\", "\\\\")
+    # Replace {expr} with Elixir interpolation #{translated_expr}
+    result = Regex.replace(~r/\{([^}]+)\}/, inner, fn _, ksy_expr ->
+      # Handle single-quoted strings inside interpolation -> just the string value
+      ksy_expr = String.trim(ksy_expr)
+      if String.starts_with?(ksy_expr, "'") and String.ends_with?(ksy_expr, "'") do
+        content = String.slice(ksy_expr, 1..-2//1)
+        "\#{\"" <> content <> "\"}"
+      else
+        translated = do_translate(ksy_expr, mode)
+        "\#{to_string(" <> translated <> ")}"
+      end
+    end)
+    "\"" <> result <> "\""
+  end
+
   defp translate_byte_array(expr, mode) do
     inner = String.slice(expr, 1..-2//1) |> String.trim()
     if inner == "" do
       "<<>>"
     else
-      items = String.split(inner, ",") |> Enum.map(fn s ->
-        do_translate(String.trim(s), mode)
+      raw_items = String.split(inner, ",") |> Enum.map(&String.trim/1)
+
+      # Detect if this should be a list (non-byte elements) or a binary (byte array)
+      has_strings = Enum.any?(raw_items, &(String.starts_with?(&1, "\"") or String.starts_with?(&1, "'")))
+      has_floats = Enum.any?(raw_items, &String.contains?(&1, "."))
+      has_large_ints = Enum.any?(raw_items, fn s ->
+        case Integer.parse(s) do
+          {n, ""} -> n > 255 or n < 0
+          _ -> false
+        end
       end)
-      "<<#{Enum.join(items, ", ")}>>"
+      # If any item is a non-literal (identifier, expression), use a list
+      has_non_literals = Enum.any?(raw_items, fn s ->
+        not (is_integer_literal?(s) or String.starts_with?(s, "0x") or String.starts_with?(s, "0o") or
+             String.starts_with?(s, "\"") or String.starts_with?(s, "'"))
+      end)
+
+      items = Enum.map(raw_items, fn s -> do_translate(s, mode) end)
+
+      if has_strings or has_floats or has_large_ints or has_non_literals do
+        # Use Elixir list
+        "[#{Enum.join(items, ", ")}]"
+      else
+        "<<#{Enum.join(items, ", ")}>>"
+      end
     end
   end
 
@@ -246,10 +300,16 @@ defmodule Ksc.Expression do
     left_t = do_translate(left, mode)
     right_t = do_translate(right, mode)
 
-    if String.trim(op) == "+" and is_string_expr?(left) and is_string_expr?(right) do
-      "#{left_t} <> #{right_t}"
-    else
-      "(#{left_t} #{String.trim(op)} #{right_t})"
+    cond do
+      String.trim(op) != "+" ->
+        "(#{left_t} #{String.trim(op)} #{right_t})"
+      is_string_expr?(left) or is_string_expr?(right) ->
+        "#{left_t} <> #{right_t}"
+      is_numeric_expr?(left) and is_numeric_expr?(right) ->
+        "(#{left_t} + #{right_t})"
+      true ->
+        # Could be string concat or arithmetic - decide at runtime
+        "Ksc.Stream.kaitai_add(#{left_t}, #{right_t})"
     end
   end
 
@@ -274,9 +334,26 @@ defmodule Ksc.Expression do
         method = String.slice(expr, (pos + 1)..-1//1) |> String.trim()
 
         case method do
-          "size" -> "Ksc.Stream.kaitai_size(#{do_translate(obj, mode)})"
+          "size" ->
+            if String.ends_with?(obj, "._io") do
+              # X._io.size -> size of the IO stream for X
+              inner = String.slice(obj, 0..-5//1)
+              "Ksc.Stream.kaitai_io_size(#{do_translate(inner, mode)})"
+            else
+              "Ksc.Stream.kaitai_size(#{do_translate(obj, mode)})"
+            end
           "length" -> "Ksc.Stream.kaitai_length(#{do_translate(obj, mode)})"
-          "to_i" -> "Ksc.Stream.to_i(#{do_translate(obj, mode)})"
+          "to_i" ->
+            # Check if the object is a cross-module enum reference (contains ::)
+            if String.contains?(obj, "::") do
+              parts = String.split(obj, "::")
+              value = List.last(parts) |> String.trim()
+              # Build module path for the enum's reverse map
+              # e.g., "enum_0::animal::cat" -> use @kaitai_enum_reverse from local (inherited enums)
+              "Ksc.Stream.to_i(:#{value}, @kaitai_enum_reverse)"
+            else
+              "Ksc.Stream.to_i(#{do_translate(obj, mode)}, @kaitai_enum_reverse)"
+            end
           "to_s" -> "to_string(#{do_translate(obj, mode)})"
           "to_f" -> "(#{do_translate(obj, mode)} / 1.0)"
           "reverse" -> ":binary.bin_to_list(#{do_translate(obj, mode)}) |> Enum.reverse() |> :binary.list_to_bin()"
@@ -285,6 +362,25 @@ defmodule Ksc.Expression do
           "min" -> "Ksc.Stream.kaitai_min(#{do_translate(obj, mode)})"
           "max" -> "Ksc.Stream.kaitai_max(#{do_translate(obj, mode)})"
           "as_s" -> "#{do_translate(obj, mode)}"
+          "_sizeof" ->
+            # field._sizeof -> if obj is a simple field access, look up from parent
+            # e.g. block1.a._sizeof -> result[:block1][:_sizeof_a] (parent stores field sizes)
+            # e.g. block1._sizeof -> result[:block1][:_sizeof] (map stores own sizeof)
+            case find_last_dot(obj) do
+              nil ->
+                # Simple field: e.g. block1._sizeof
+                translated_obj = do_translate(obj, mode)
+                "Ksc.Stream.kaitai_sizeof(#{translated_obj})"
+              parent_dot ->
+                parent_obj = String.slice(obj, 0, parent_dot) |> String.trim()
+                field_name = String.slice(obj, (parent_dot + 1)..-1//1) |> String.trim()
+                translated_parent = do_translate(parent_obj, mode)
+                # Try the field's own _sizeof first, fall back to parent's _sizeof_field
+                "(#{translated_parent}[:_sizeof_#{field_name}] || Ksc.Stream.kaitai_sizeof(#{translated_parent}[:#{field_name}]))"
+            end
+          "_io" ->
+            # ._io returns the object itself (it stores _io_data and _io_size)
+            do_translate(obj, mode)
           _ ->
             cond do
               # .as<Type> cast - no-op in Elixir (dynamically typed)
@@ -311,10 +407,20 @@ defmodule Ksc.Expression do
               true ->
                 translated_obj = do_translate(obj, mode)
                 # Field access on a parsed result - use map access
-                if Regex.match?(~r/^[a-z_][a-zA-Z0-9_]*$/, method) do
-                  "#{translated_obj}[:#{method}]"
-                else
-                  "#{translated_obj}.#{method}"
+                cond do
+                  Regex.match?(~r/^[a-z_][a-zA-Z0-9_]*$/, method) ->
+                    "#{translated_obj}[:#{method}]"
+                  # Method part contains array access like "sizes[idx]" - split and handle
+                  Regex.match?(~r/^[a-z_][a-zA-Z0-9_]*\[/, method) ->
+                    # Re-translate the whole expression by first translating obj.field, then the array part
+                    case Regex.run(~r/^([a-z_][a-zA-Z0-9_]*)\[(.+)\]$/, method) do
+                      [_, field, idx_expr] ->
+                        "Ksc.Stream.kaitai_at(#{translated_obj}[:#{field}], #{do_translate(idx_expr, mode)})"
+                      nil ->
+                        "#{translated_obj}.#{method}"
+                    end
+                  true ->
+                    "#{translated_obj}.#{method}"
                 end
             end
         end
@@ -395,6 +501,7 @@ defmodule Ksc.Expression do
       "_parent" -> "parent_"
       "_io" -> "_io"
       "_index" -> "var__index"
+      "_sizeof" -> "__sizeof__()"
       "_" when mode == :repeat_until -> "item"
       "_" -> "_"
       "true" -> "true"
@@ -409,9 +516,32 @@ defmodule Ksc.Expression do
     end
   end
 
+  defp is_numeric_expr?(expr) do
+    t = String.trim(expr)
+    cond do
+      is_integer_literal?(t) -> true
+      is_float_literal?(t) -> true
+      String.starts_with?(t, "0x") -> true
+      t == "_io.pos" or t == "_io.size" -> true
+      String.ends_with?(t, ".to_i") -> true
+      String.ends_with?(t, ".size") -> true
+      String.ends_with?(t, ".length") -> true
+      # Arithmetic ops
+      String.contains?(t, " * ") or String.contains?(t, " / ") or String.contains?(t, " % ") -> true
+      true -> false
+    end
+  end
+
   defp is_string_expr?(expr) do
     t = String.trim(expr)
-    String.starts_with?(t, "\"") and String.ends_with?(t, "\"")
+    cond do
+      String.starts_with?(t, "\"") and String.ends_with?(t, "\"") -> true
+      String.ends_with?(t, ".to_s") -> true
+      String.ends_with?(t, ".as_s") -> true
+      # String concatenation chain: contains " + " with a string literal somewhere
+      String.contains?(t, " + ") and (String.contains?(t, "\"") or String.contains?(t, ".to_s")) -> true
+      true -> false
+    end
   end
 
   defp is_integer_literal?(expr) do

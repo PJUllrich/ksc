@@ -127,48 +127,39 @@ defmodule ValidateAllTest do
       {:index, idx}, acc when is_list(acc) ->
         Enum.at(acc, idx)
 
-      {:method, "size"}, acc when is_list(acc) ->
-        length(acc)
+      {:index, idx}, acc when is_binary(acc) ->
+        :binary.at(acc, idx)
 
-      {:method, "size"}, acc when is_binary(acc) ->
-        byte_size(acc)
+      {:method, name}, acc when is_map(acc) ->
+        # If it's a map, try field access first (these names might be fields)
+        key = String.to_atom(name)
+        if Map.has_key?(acc, key) do
+          Map.fetch!(acc, key)
+        else
+          apply_method(name, acc)
+        end
 
-      {:method, "size"}, acc when is_integer(acc) ->
-        acc
-
-      {:method, "length"}, acc when is_binary(acc) ->
-        String.length(acc)
-
-      {:method, "length"}, acc when is_integer(acc) ->
-        # .length on an integer doesn't make sense, but some tests use it
-        acc
-
-      {:method, "to_i"}, acc ->
-        Ksc.Stream.to_i(acc)
-
-      {:method, "to_s"}, acc when is_binary(acc) ->
-        acc
-
-      {:method, "to_s"}, acc when is_integer(acc) ->
-        Integer.to_string(acc)
-
-      {:method, "first"}, acc when is_list(acc) ->
-        List.first(acc)
-
-      {:method, "first"}, acc when is_binary(acc) ->
-        :binary.at(acc, 0)
-
-      {:method, "last"}, acc when is_list(acc) ->
-        List.last(acc)
-
-      {:method, "last"}, acc when is_binary(acc) ->
-        :binary.at(acc, byte_size(acc) - 1)
+      {:method, name}, acc ->
+        apply_method(name, acc)
 
       {:cast, _type}, acc ->
         # Type casts like .as<type> - just pass through
         acc
     end)
   end
+
+  defp apply_method("size", acc) when is_list(acc), do: length(acc)
+  defp apply_method("size", acc) when is_binary(acc), do: byte_size(acc)
+  defp apply_method("size", acc) when is_integer(acc), do: acc
+  defp apply_method("length", acc) when is_binary(acc), do: String.length(acc)
+  defp apply_method("length", acc) when is_integer(acc), do: acc
+  defp apply_method("to_i", acc), do: Ksc.Stream.to_i(acc)
+  defp apply_method("to_s", acc) when is_binary(acc), do: acc
+  defp apply_method("to_s", acc) when is_integer(acc), do: Integer.to_string(acc)
+  defp apply_method("first", acc) when is_list(acc), do: List.first(acc)
+  defp apply_method("first", acc) when is_binary(acc), do: :binary.at(acc, 0)
+  defp apply_method("last", acc) when is_list(acc), do: List.last(acc)
+  defp apply_method("last", acc) when is_binary(acc), do: :binary.at(acc, byte_size(acc) - 1)
 
   @method_names ~w(size length to_i to_s first last)
 
@@ -179,12 +170,15 @@ defmodule ValidateAllTest do
     # Split on dots, handling array indices
     parts = String.split(path, ".")
 
-    Enum.flat_map(parts, fn part ->
+    parts
+    |> Enum.with_index()
+    |> Enum.flat_map(fn {part, index} ->
       case Regex.run(~r/^(.+)\[(\d+)\]$/, part) do
         [_, name, idx] ->
           [{:field, name}, {:index, String.to_integer(idx)}]
         nil ->
-          if part in @method_names do
+          # First part is always a field; only subsequent parts can be methods
+          if index > 0 and part in @method_names do
             [{:method, part}]
           else
             [{:field, part}]
@@ -210,7 +204,13 @@ defmodule ValidateAllTest do
 
       # Quoted string: '"some text"'
       String.starts_with?(val, "\"") and String.ends_with?(val, "\"") ->
-        {:string, String.slice(val, 1..-2//1)}
+        str = String.slice(val, 1..-2//1)
+        # Unescape \uXXXX sequences
+        str = Regex.replace(~r/\\u([0-9a-fA-F]{4})/, str, fn _, hex ->
+          {cp, _} = Integer.parse(hex, 16)
+          <<cp::utf8>>
+        end)
+        {:string, str}
 
       # Hex integer literal: '0xffffffff' or '0xffff_ffff'
       Regex.match?(~r/^0x[0-9a-fA-F_]+$/, val) ->
@@ -224,8 +224,8 @@ defmodule ValidateAllTest do
         {int_val, _} = Integer.parse(bin_str, 2)
         {:int, int_val}
 
-      # Array of strings: '["foo", "bar"]'
-      Regex.match?(~r/^\[.*".*\]/, val) ->
+      # Array of strings: '["foo", "bar"]' or "['foo', 'bar']"
+      Regex.match?(~r/^\[.*["'].*\]/, val) ->
         {:string_array, parse_string_array(val)}
 
       # Byte array: '[0x73, 0x74, ...]' or '[...].as<bytes>'
@@ -243,6 +243,19 @@ defmodule ValidateAllTest do
       val == "false" -> {:bool, false}
       val == "null" -> {:null, nil}
 
+      # Simple arithmetic expression: "1 + 4 + 2" -> 7
+      Regex.match?(~r/^[\d\s\+\-\*\/]+$/, val) and String.contains?(val, " ") ->
+        try do
+          {result, _} = Code.eval_string(val)
+          if is_integer(result), do: {:int, result}, else: {:float, result}
+        rescue
+          _ -> {:raw, val}
+        end
+
+      # Negative zero: -0 is just 0, -0.0 is -0.0 (Elixir preserves float sign)
+      val == "-0" -> {:int, 0}
+      val == "-0.0" -> {:float, -0.0}
+
       true ->
         {:raw, val}
     end
@@ -257,9 +270,15 @@ defmodule ValidateAllTest do
     if inner == "" do
       []
     else
-      # Parse comma-separated quoted strings
-      Regex.scan(~r/"([^"]*)"/, inner)
-      |> Enum.map(fn [_, s] -> s end)
+      # Parse comma-separated quoted strings (double or single quoted)
+      results = Regex.scan(~r/"([^"]*)"/, inner)
+      if results == [] do
+        # Try single-quoted strings
+        Regex.scan(~r/'([^']*)'/, inner)
+        |> Enum.map(fn [_, s] -> s end)
+      else
+        Enum.map(results, fn [_, s] -> s end)
+      end
     end
   end
 
@@ -284,8 +303,16 @@ defmodule ValidateAllTest do
           String.starts_with?(s, "0x") ->
             {val, _} = Integer.parse(String.trim_leading(s, "0x"), 16)
             val
-          true ->
+          Regex.match?(~r/^-?\d+$/, s) ->
             String.to_integer(s)
+          true ->
+            # Try evaluating arithmetic expression like "0 + 1"
+            try do
+              {val, _} = Code.eval_string(s)
+              val
+            rescue
+              _ -> String.to_integer(s)
+            end
         end
       end)
     end

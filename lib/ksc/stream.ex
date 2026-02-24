@@ -30,6 +30,74 @@ defmodule Ksc.Stream do
     end
   end
 
+  @doc "Parse items repeatedly until binary is exhausted, with index tracking."
+  def repeat_eos_idx(data, parse_fn) do
+    repeat_eos_idx_acc(data, parse_fn, [], 0)
+  end
+
+  defp repeat_eos_idx_acc(<<>>, _parse_fn, acc, _idx), do: {Enum.reverse(acc), <<>>}
+
+  defp repeat_eos_idx_acc(data, parse_fn, acc, idx) do
+    {item, rest} = parse_fn.(data, idx)
+    repeat_eos_idx_acc(rest, parse_fn, [item | acc], idx + 1)
+  end
+
+  @doc "Parse items repeatedly until condition is met, with index tracking."
+  def repeat_until_idx(data, parse_fn, until_fn) do
+    repeat_until_idx_acc(data, parse_fn, until_fn, [], 0)
+  end
+
+  defp repeat_until_idx_acc(data, parse_fn, until_fn, acc, idx) do
+    {item, rest} = parse_fn.(data, idx)
+    new_acc = acc ++ [item]
+
+    if until_fn.(item, new_acc) do
+      {new_acc, rest}
+    else
+      repeat_until_idx_acc(rest, parse_fn, until_fn, new_acc, idx + 1)
+    end
+  end
+
+  @doc "Parse items until parse fn signals done (returns {item, rest, true})."
+  def repeat_until_check(data, parse_fn) do
+    repeat_until_check_acc(data, parse_fn, [])
+  end
+
+  defp repeat_until_check_acc(data, parse_fn, acc) do
+    {item, rest, done} = parse_fn.(data)
+    new_acc = acc ++ [item]
+    if done, do: {new_acc, rest}, else: repeat_until_check_acc(rest, parse_fn, new_acc)
+  end
+
+  @doc "Parse items until parse fn signals done, with index tracking."
+  def repeat_until_check_idx(data, parse_fn) do
+    repeat_until_check_idx_acc(data, parse_fn, [], 0)
+  end
+
+  defp repeat_until_check_idx_acc(data, parse_fn, acc, idx) do
+    {item, rest, done} = parse_fn.(data, idx)
+    new_acc = acc ++ [item]
+    if done, do: {new_acc, rest}, else: repeat_until_check_idx_acc(rest, parse_fn, new_acc, idx + 1)
+  end
+
+  @doc "Parse bit items repeatedly until binary is exhausted."
+  def repeat_eos_bits(data, num_bits, bit_fn) do
+    bits_state = {0, 0, data}
+    repeat_eos_bits_acc(bits_state, num_bits, bit_fn, [])
+  end
+
+  defp repeat_eos_bits_acc({_, 0, <<>>}, _num_bits, _bit_fn, acc), do: {Enum.reverse(acc), <<>>}
+  defp repeat_eos_bits_acc({bits_acc, bits_left, data} = state, num_bits, bit_fn, acc) do
+    # Check if we have enough bits left to read
+    total_bits = bits_left + byte_size(data) * 8
+    if total_bits < num_bits do
+      {Enum.reverse(acc), align_to_byte(state)}
+    else
+      {item, new_state} = bit_fn.(state, num_bits)
+      repeat_eos_bits_acc(new_state, num_bits, bit_fn, [item | acc])
+    end
+  end
+
   @doc "Strip trailing pad bytes from binary."
   def strip_pad_right(data, pad_byte) when is_binary(data) and is_integer(pad_byte) do
     data
@@ -47,6 +115,24 @@ defmodule Ksc.Stream do
     case Enum.find_index(bytes, &(&1 == term_byte)) do
       nil ->
         data
+
+      idx ->
+        if include do
+          :binary.list_to_bin(Enum.take(bytes, idx + 1))
+        else
+          :binary.list_to_bin(Enum.take(bytes, idx))
+        end
+    end
+  end
+
+  @doc "Terminate at terminator, then strip pad bytes only when terminator was NOT found."
+  def terminate_and_pad(data, term_byte, include, pad_byte) do
+    bytes = :binary.bin_to_list(data)
+
+    case Enum.find_index(bytes, &(&1 == term_byte)) do
+      nil ->
+        # No terminator found - strip pad bytes from the right
+        strip_pad_right(data, pad_byte)
 
       idx ->
         if include do
@@ -215,7 +301,16 @@ defmodule Ksc.Stream do
   def kaitai_size(nil), do: 0
   def kaitai_size(bin) when is_binary(bin), do: byte_size(bin)
   def kaitai_size(list) when is_list(list), do: length(list)
+  def kaitai_size(%{_io_size: size}), do: size
   def kaitai_size(%{} = map), do: map_size(map)
+
+  @doc "Get the sizeof a parsed type or field. Uses stored _sizeof metadata."
+  def kaitai_sizeof(%{_sizeof: size}), do: size
+  def kaitai_sizeof(_), do: 0
+
+  @doc "Get the IO stream size for a parsed object. Uses stored _io_size metadata."
+  def kaitai_io_size(%{_io_size: size}), do: size
+  def kaitai_io_size(_), do: 0
 
   @doc "Get minimum value from a list or binary (treating bytes as values)."
   def kaitai_min(bin) when is_binary(bin), do: :binary.bin_to_list(bin) |> Enum.min()
@@ -251,6 +346,12 @@ defmodule Ksc.Stream do
     end
   end
   def to_i(x) when is_atom(x), do: 0
+
+  @doc "Convert value to integer with enum reverse lookup."
+  def to_i(true, _reverse_map), do: 1
+  def to_i(false, _reverse_map), do: 0
+  def to_i(x, reverse_map) when is_atom(x), do: Map.get(reverse_map, x, 0)
+  def to_i(x, _reverse_map), do: to_i(x)
 
   @doc "XOR each byte in data with a single-byte key."
   def process_xor(data, key) when is_binary(data) and is_integer(key) do
@@ -302,16 +403,20 @@ defmodule Ksc.Stream do
   end
 
   @doc "Read a null-terminated string from binary with encoding support."
-  def read_strz_enc(data, encoding, consume \\ true) do
+  def read_strz_enc(data, encoding, consume \\ true, include \\ false) do
     enc = if encoding, do: String.upcase(to_string(encoding)), else: nil
     # For UTF-16 encodings, the terminator is two null bytes
     if enc in ["UTF-16LE", "UTF-16BE"] do
-      {str_bytes, rest} = find_utf16_terminator(data, consume)
+      {str_bytes, rest} = find_utf16_terminator(data, consume, include)
       {decode_string(str_bytes, encoding), rest}
     else
       case :binary.match(data, <<0>>) do
         {pos, 1} ->
-          str = binary_part(data, 0, pos)
+          str = if include do
+            binary_part(data, 0, pos + 1)
+          else
+            binary_part(data, 0, pos)
+          end
           rest = if consume do
             binary_part(data, pos + 1, byte_size(data) - pos - 1)
           else
@@ -324,13 +429,17 @@ defmodule Ksc.Stream do
     end
   end
 
-  defp find_utf16_terminator(data, consume) do
-    find_utf16_terminator(data, 0, consume)
+  defp find_utf16_terminator(data, consume, include) do
+    find_utf16_terminator(data, 0, consume, include)
   end
 
-  defp find_utf16_terminator(data, pos, consume) when pos + 1 < byte_size(data) do
+  defp find_utf16_terminator(data, pos, consume, include) when pos + 1 < byte_size(data) do
     if :binary.at(data, pos) == 0 and :binary.at(data, pos + 1) == 0 do
-      str = binary_part(data, 0, pos)
+      str = if include do
+        binary_part(data, 0, pos + 2)
+      else
+        binary_part(data, 0, pos)
+      end
       rest = if consume do
         binary_part(data, pos + 2, byte_size(data) - pos - 2)
       else
@@ -338,16 +447,15 @@ defmodule Ksc.Stream do
       end
       {str, rest}
     else
-      find_utf16_terminator(data, pos + 2, consume)
+      find_utf16_terminator(data, pos + 2, consume, include)
     end
   end
 
-  defp find_utf16_terminator(data, _pos, _consume) do
+  defp find_utf16_terminator(data, _pos, _consume, _include) do
     {data, <<>>}
   end
 
   defp decode_sjis(data) do
-    # Simple SJIS decoder - handles single byte ASCII and double byte JIS
     decode_sjis_chars(data, [])
   end
 
@@ -355,56 +463,66 @@ defmodule Ksc.Stream do
   defp decode_sjis_chars(<<b, rest::binary>>, acc) when b < 0x80 do
     decode_sjis_chars(rest, [<<b>> | acc])
   end
-  defp decode_sjis_chars(<<b1, b2, rest::binary>>, acc) when b1 >= 0x80 do
-    # Try to use :unicode conversion through EUC-JP mapping
-    # For now, just try direct conversion
-    char = sjis_to_utf8(b1, b2)
-    decode_sjis_chars(rest, [char | acc])
+  defp decode_sjis_chars(<<b, rest::binary>>, acc) when b >= 0xA1 and b <= 0xDF do
+    # Half-width katakana
+    unicode = 0xFF61 + (b - 0xA1)
+    decode_sjis_chars(rest, [<<unicode::utf8>> | acc])
   end
-  defp decode_sjis_chars(<<b, rest::binary>>, acc) do
-    decode_sjis_chars(rest, [<<b>> | acc])
+  defp decode_sjis_chars(<<b1, b2, rest::binary>>, acc)
+       when (b1 >= 0x81 and b1 <= 0x9F) or (b1 >= 0xE0 and b1 <= 0xEF) do
+    unicode = sjis_to_unicode(b1, b2)
+    decode_sjis_chars(rest, [<<unicode::utf8>> | acc])
+  end
+  defp decode_sjis_chars(<<_b, rest::binary>>, acc) do
+    decode_sjis_chars(rest, [<<0xEF, 0xBF, 0xBD>> | acc])
   end
 
-  defp sjis_to_utf8(b1, b2) do
-    # Convert SJIS double-byte to UTF-8
-    # This is a simplified conversion - for full support would need lookup tables
-    code = bsl(b1, 8) ||| b2
-    # Use iconv-like approach: map through JIS X 0208
-    case :unicode.characters_to_binary(<<b1, b2>>, :latin1) do
-      result when is_binary(result) ->
-        # Fallback: try to look up in common SJIS ranges
-        try_sjis_conversion(code)
-      _ -> "?"
+  defp sjis_to_unicode(b1, b2) do
+    # Convert SJIS to JIS X 0208 row/col
+    {row, col} = sjis_to_jis(b1, b2)
+    jis_to_unicode(row, col)
+  end
+
+  defp sjis_to_jis(b1, b2) do
+    row_offset = if b1 < 0xA0, do: 0x70, else: 0xB0
+    row = (b1 - row_offset) * 2 - 1
+
+    {row, col} = if b2 >= 0x9F do
+      {row + 1, b2 - 0x7E}
+    else
+      col = if b2 > 0x7F, do: b2 - 0x40, else: b2 - 0x3F
+      {row, col + 0x20}
+    end
+
+    {row, col}
+  end
+
+  defp jis_to_unicode(row, col) do
+    cond do
+      row == 0x24 -> 0x3020 + col  # Hiragana
+      row == 0x25 -> 0x3080 + col  # Katakana
+      row == 0x21 -> jis_symbols_row1(col) # Symbols row 1
+      row == 0x23 -> jis_fullwidth_ascii(col) # Full-width ASCII
+      true -> 0xFFFD
     end
   end
 
-  defp try_sjis_conversion(code) do
-    # Map common SJIS katakana/hiragana ranges to Unicode
-    # SJIS 0x82A0-0x82F1 = Hiragana
-    # SJIS 0x8340-0x8396 = Katakana
+  defp jis_symbols_row1(col) do
+    # Common JIS X 0208 row 1 symbols
+    table = %{
+      0x21 => 0x3000, 0x22 => 0x3001, 0x23 => 0x3002, 0x24 => 0xFF0C,
+      0x25 => 0xFF0E, 0x26 => 0x30FB, 0x27 => 0xFF1A, 0x28 => 0xFF1B,
+      0x29 => 0xFF1F, 0x2A => 0xFF01, 0x3C => 0xFF0D, 0x5C => 0x30FC
+    }
+    Map.get(table, col, 0xFFFD)
+  end
+
+  defp jis_fullwidth_ascii(col) do
     cond do
-      code >= 0x8281 and code <= 0x829A ->
-        # Lowercase ASCII a-z mapped
-        <<code - 0x8281 + ?a>>
-      code >= 0x8260 and code <= 0x8279 ->
-        # Uppercase ASCII A-Z mapped
-        <<code - 0x8260 + ?A>>
-      code >= 0x824F and code <= 0x8258 ->
-        # Digits 0-9
-        <<code - 0x824F + ?0>>
-      code >= 0x82A0 and code <= 0x82F1 ->
-        # Hiragana: SJIS 0x82A0 = U+3041 (ぁ), but common start 0x82A0=ぁ
-        unicode_point = 0x3041 + (code - 0x82A0)
-        <<unicode_point::utf8>>
-      code >= 0x8340 and code <= 0x8396 ->
-        # Katakana: SJIS 0x8340 = U+30A1 (ァ)
-        offset = code - 0x8340
-        # Skip 0x837F which is not a valid SJIS byte
-        offset = if code > 0x837E, do: offset - 1, else: offset
-        unicode_point = 0x30A1 + offset
-        <<unicode_point::utf8>>
-      true ->
-        <<0xEF, 0xBF, 0xBD>>  # Unicode replacement character
+      col >= 0x30 and col <= 0x39 -> 0xFF10 + (col - 0x30)  # 0-9
+      col >= 0x41 and col <= 0x5A -> 0xFF21 + (col - 0x41)  # A-Z
+      col >= 0x61 and col <= 0x7A -> 0xFF41 + (col - 0x61)  # a-z
+      true -> 0xFFFD
     end
   end
 
@@ -451,6 +569,13 @@ defmodule Ksc.Stream do
     }
     Map.get(table, b, 0xFFFD)
   end
+
+  @doc "KSY add operator - string concat or arithmetic add."
+  def kaitai_add(a, b) when is_binary(a) and is_binary(b), do: a <> b
+  def kaitai_add(a, b) when is_binary(a), do: a <> to_string(b)
+  def kaitai_add(a, b) when is_binary(b), do: to_string(a) <> b
+  def kaitai_add(a, b) when is_list(a) and is_list(b), do: a ++ b
+  def kaitai_add(a, b), do: a + b
 
   @doc "Zlib decompress."
   def process_zlib(data) when is_binary(data) do
