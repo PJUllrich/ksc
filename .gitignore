@@ -23,6 +23,4 @@ erl_crash.dump
 ksc-*.tar
 
 /reference_code
-
-/.devcontainer
 /.claude

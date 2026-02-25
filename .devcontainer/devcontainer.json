@@ -1,0 +1,34 @@
+{
+  "name": "KSC Dev",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "args": {
+      "TZ": "${localEnv:TZ:America/Los_Angeles}",
+      "ZSH_IN_DOCKER_VERSION": "1.2.0",
+    },
+  },
+  "runArgs": ["--cap-add=NET_ADMIN", "--cap-add=NET_RAW"],
+  "remoteUser": "dev",
+  "mounts": [
+    "source=devcontainer-bashhistory-${devcontainerId},target=/commandhistory,type=volume",
+    "source=${localEnv:HOME}/.claude,target=/home/dev/.claude,type=bind,consistency=cached",
+    "source=devcontainer-mix-${devcontainerId},target=/home/dev/.mix,type=volume",
+    "source=devcontainer-hex-${devcontainerId},target=/home/dev/.hex,type=volume",
+  ],
+  "containerEnv": {
+    "CLAUDE_CONFIG_DIR": "/home/dev/.claude",
+    "LOCAL_WORKSPACE_FOLDER": "${localWorkspaceFolder}",
+    "MIX_ENV": "dev",
+    "POWERLEVEL9K_DISABLE_GITSTATUS": "true",
+    "HTTP_PROXY": "http://localhost:3128",
+    "HTTPS_PROXY": "http://localhost:3128",
+    "http_proxy": "http://localhost:3128",
+    "https_proxy": "http://localhost:3128",
+    "NO_PROXY": "localhost,127.0.0.1",
+    "no_proxy": "localhost,127.0.0.1",
+  },
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=delegated",
+  "workspaceFolder": "/workspace",
+  "postStartCommand": "sudo /usr/local/bin/init-firewall.sh && /usr/local/bin/link-claude-project.sh",
+  "waitFor": "postStartCommand",
+}
