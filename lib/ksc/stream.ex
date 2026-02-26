@@ -21,10 +21,10 @@ defmodule Ksc.Stream do
 
   defp repeat_until_acc(data, parse_fn, until_fn, acc) do
     {item, rest} = parse_fn.(data)
-    new_acc = acc ++ [item]
+    new_acc = [item | acc]
 
     if until_fn.(item, new_acc) do
-      {new_acc, rest}
+      {Enum.reverse(new_acc), rest}
     else
       repeat_until_acc(rest, parse_fn, until_fn, new_acc)
     end
@@ -49,10 +49,10 @@ defmodule Ksc.Stream do
 
   defp repeat_until_idx_acc(data, parse_fn, until_fn, acc, idx) do
     {item, rest} = parse_fn.(data, idx)
-    new_acc = acc ++ [item]
+    new_acc = [item | acc]
 
     if until_fn.(item, new_acc) do
-      {new_acc, rest}
+      {Enum.reverse(new_acc), rest}
     else
       repeat_until_idx_acc(rest, parse_fn, until_fn, new_acc, idx + 1)
     end
@@ -65,8 +65,8 @@ defmodule Ksc.Stream do
 
   defp repeat_until_check_acc(data, parse_fn, acc) do
     {item, rest, done} = parse_fn.(data)
-    new_acc = acc ++ [item]
-    if done, do: {new_acc, rest}, else: repeat_until_check_acc(rest, parse_fn, new_acc)
+    new_acc = [item | acc]
+    if done, do: {Enum.reverse(new_acc), rest}, else: repeat_until_check_acc(rest, parse_fn, new_acc)
   end
 
   @doc "Parse items until parse fn signals done, with index tracking."
@@ -76,8 +76,8 @@ defmodule Ksc.Stream do
 
   defp repeat_until_check_idx_acc(data, parse_fn, acc, idx) do
     {item, rest, done} = parse_fn.(data, idx)
-    new_acc = acc ++ [item]
-    if done, do: {new_acc, rest}, else: repeat_until_check_idx_acc(rest, parse_fn, new_acc, idx + 1)
+    new_acc = [item | acc]
+    if done, do: {Enum.reverse(new_acc), rest}, else: repeat_until_check_idx_acc(rest, parse_fn, new_acc, idx + 1)
   end
 
   @doc "Parse bit items repeatedly until binary is exhausted."
@@ -100,28 +100,30 @@ defmodule Ksc.Stream do
 
   @doc "Strip trailing pad bytes from binary."
   def strip_pad_right(data, pad_byte) when is_binary(data) and is_integer(pad_byte) do
-    data
-    |> :binary.bin_to_list()
-    |> Enum.reverse()
-    |> Enum.drop_while(&(&1 == pad_byte))
-    |> Enum.reverse()
-    |> :binary.list_to_bin()
+    do_strip_pad_right(data, byte_size(data), pad_byte)
+  end
+
+  defp do_strip_pad_right(_data, 0, _pad_byte), do: <<>>
+  defp do_strip_pad_right(data, pos, pad_byte) do
+    if :binary.at(data, pos - 1) == pad_byte do
+      do_strip_pad_right(data, pos - 1, pad_byte)
+    else
+      binary_part(data, 0, pos)
+    end
   end
 
   @doc "Terminate binary at first occurrence of byte."
   def terminate_at(data, term_byte, include \\ false) do
-    bytes = :binary.bin_to_list(data)
-
-    case Enum.find_index(bytes, &(&1 == term_byte)) do
-      nil ->
-        data
-
-      idx ->
+    case :binary.match(data, <<term_byte>>) do
+      {pos, 1} ->
         if include do
-          :binary.list_to_bin(Enum.take(bytes, idx + 1))
+          binary_part(data, 0, pos + 1)
         else
-          :binary.list_to_bin(Enum.take(bytes, idx))
+          binary_part(data, 0, pos)
         end
+
+      :nomatch ->
+        data
     end
   end
 
@@ -172,23 +174,15 @@ defmodule Ksc.Stream do
   - include: if true, the terminator byte is included in the returned value
   """
   def read_terminated(data, term_byte, consume \\ true, include \\ false) do
-    bytes = :binary.bin_to_list(data)
+    case :binary.match(data, <<term_byte>>) do
+      {pos, 1} ->
+        result = if include, do: binary_part(data, 0, pos + 1), else: binary_part(data, 0, pos)
+        rest_start = if consume, do: pos + 1, else: pos
+        rest = binary_part(data, rest_start, byte_size(data) - rest_start)
+        {result, rest}
 
-    case Enum.find_index(bytes, &(&1 == term_byte)) do
-      nil ->
+      :nomatch ->
         {data, <<>>}
-
-      idx ->
-        result_bytes = if include do
-          Enum.take(bytes, idx + 1)
-        else
-          Enum.take(bytes, idx)
-        end
-
-        rest_start = if consume, do: idx + 1, else: idx
-        rest_bytes = Enum.drop(bytes, rest_start)
-
-        {:binary.list_to_bin(result_bytes), :binary.list_to_bin(rest_bytes)}
     end
   end
 
@@ -244,14 +238,15 @@ defmodule Ksc.Stream do
     if bits_left >= num_bits do
       {bits_acc, bits_left, data}
     else
-      # Need more bytes
       bytes_needed = div(num_bits - bits_left + 7, 8)
       <<new_bytes::binary-size(bytes_needed), rest::binary>> = data
-      new_bits = :binary.bin_to_list(new_bytes)
-        |> Enum.reduce(bits_acc, fn byte, acc -> bor(bsl(acc, 8), byte) end)
+      new_bits = accum_bits_be(new_bytes, bits_acc)
       {new_bits, bits_left + bytes_needed * 8, rest}
     end
   end
+
+  defp accum_bits_be(<<b, rest::binary>>, acc), do: accum_bits_be(rest, bor(bsl(acc, 8), b))
+  defp accum_bits_be(<<>>, acc), do: acc
 
   defp ensure_bits_le(bits_acc, bits_left, data, num_bits) do
     if bits_left >= num_bits do
@@ -259,14 +254,13 @@ defmodule Ksc.Stream do
     else
       bytes_needed = div(num_bits - bits_left + 7, 8)
       <<new_bytes::binary-size(bytes_needed), rest::binary>> = data
-      new_bits = :binary.bin_to_list(new_bytes)
-        |> Enum.with_index()
-        |> Enum.reduce(bits_acc, fn {byte, idx}, acc ->
-          bor(acc, bsl(byte, bits_left + idx * 8))
-        end)
+      new_bits = accum_bits_le(new_bytes, bits_acc, bits_left)
       {new_bits, bits_left + bytes_needed * 8, rest}
     end
   end
+
+  defp accum_bits_le(<<b, rest::binary>>, acc, shift), do: accum_bits_le(rest, bor(acc, bsl(b, shift)), shift + 8)
+  defp accum_bits_le(<<>>, acc, _shift), do: acc
 
   @doc "Floor division (Python-style: result rounds towards negative infinity)."
   def floor_div(a, b) when is_integer(a) and is_integer(b) do
@@ -304,12 +298,20 @@ defmodule Ksc.Stream do
   def kaitai_io_size(_), do: 0
 
   @doc "Get minimum value from a list or binary (treating bytes as values)."
-  def kaitai_min(bin) when is_binary(bin), do: :binary.bin_to_list(bin) |> Enum.min()
+  def kaitai_min(<<first, rest::binary>>), do: do_bin_min(rest, first)
   def kaitai_min(list) when is_list(list), do: Enum.min(list)
 
+  defp do_bin_min(<<b, rest::binary>>, m) when b < m, do: do_bin_min(rest, b)
+  defp do_bin_min(<<_, rest::binary>>, m), do: do_bin_min(rest, m)
+  defp do_bin_min(<<>>, m), do: m
+
   @doc "Get maximum value from a list or binary."
-  def kaitai_max(bin) when is_binary(bin), do: :binary.bin_to_list(bin) |> Enum.max()
+  def kaitai_max(<<first, rest::binary>>), do: do_bin_max(rest, first)
   def kaitai_max(list) when is_list(list), do: Enum.max(list)
+
+  defp do_bin_max(<<b, rest::binary>>, m) when b > m, do: do_bin_max(rest, b)
+  defp do_bin_max(<<_, rest::binary>>, m), do: do_bin_max(rest, m)
+  defp do_bin_max(<<>>, m), do: m
 
   @doc "Access element at index (supports both lists and binaries)."
   def kaitai_at(bin, idx) when is_binary(bin), do: :binary.at(bin, idx)
@@ -350,34 +352,27 @@ defmodule Ksc.Stream do
 
   @doc "XOR each byte in data with a single-byte key."
   def process_xor(data, key) when is_binary(data) and is_integer(key) do
-    :binary.bin_to_list(data)
-    |> Enum.map(fn b -> bxor(b, key) end)
-    |> :binary.list_to_bin()
+    for <<b <- data>>, into: <<>>, do: <<bxor(b, key)>>
   end
 
   def process_xor(data, key) when is_binary(data) and is_binary(key) do
-    key_bytes = :binary.bin_to_list(key)
-    key_len = length(key_bytes)
-    :binary.bin_to_list(data)
-    |> Enum.with_index()
-    |> Enum.map(fn {b, idx} ->
-      bxor(b, Enum.at(key_bytes, rem(idx, key_len)))
-    end)
-    |> :binary.list_to_bin()
+    key_len = byte_size(key)
+    do_xor_key(data, key, key_len, 0, [])
   end
 
   def process_xor(data, key) when is_binary(data) and is_list(key) do
     process_xor(data, :binary.list_to_bin(key))
   end
 
+  defp do_xor_key(<<b, rest::binary>>, key, kl, i, acc) do
+    do_xor_key(rest, key, kl, i + 1, [bxor(b, :binary.at(key, rem(i, kl))) | acc])
+  end
+  defp do_xor_key(<<>>, _, _, _, acc), do: acc |> :lists.reverse() |> IO.iodata_to_binary()
+
   @doc "Rotate each byte left by amount bits."
   def process_rotate_left(data, amount) when is_binary(data) and is_integer(amount) do
     amount = rem(amount, 8)
-    :binary.bin_to_list(data)
-    |> Enum.map(fn b ->
-      band(bor(bsl(b, amount), bsr(b, 8 - amount)), 0xFF)
-    end)
-    |> :binary.list_to_bin()
+    for <<b <- data>>, into: <<>>, do: <<band(bor(bsl(b, amount), bsr(b, 8 - amount)), 0xFF)>>
   end
 
   @doc "Decode a binary from the given encoding to a UTF-8 string."

@@ -24,41 +24,41 @@ defmodule Ksc.Expression do
       expr == "null" -> "nil"
 
       # Ternary: cond ? a : b
-      has_ternary?(expr) ->
-        translate_ternary(expr, mode)
+      (q_pos = find_operator_outside_groups(expr, " ? ")) != nil ->
+        translate_ternary_at(expr, q_pos, mode)
 
       # Boolean operators
-      has_binary_op?(expr, [" or ", " and "]) ->
-        translate_binary_op(expr, [" or ", " and "], mode)
+      (match = find_rightmost_op_outside_groups(expr, [" or ", " and "])) != nil ->
+        translate_binary_op_at(expr, match, mode)
 
       # Comparison
-      has_binary_op?(expr, [" == ", " != ", " <= ", " >= ", " < ", " > "]) ->
-        translate_binary_op(expr, [" == ", " != ", " <= ", " >= ", " < ", " > "], mode)
+      (match = find_rightmost_op_outside_groups(expr, [" == ", " != ", " <= ", " >= ", " < ", " > "])) != nil ->
+        translate_binary_op_at(expr, match, mode)
 
       # Bitwise
-      has_binary_op?(expr, [" | ", " & ", " ^ "]) ->
-        translate_bitwise(expr, mode)
+      (match = find_rightmost_op_outside_groups(expr, [" | ", " & ", " ^ "])) != nil ->
+        translate_bitwise_at(expr, match, mode)
 
       # Shift
-      has_binary_op?(expr, [" << ", " >> "]) ->
-        translate_shift(expr, mode)
+      (match = find_rightmost_op_outside_groups(expr, [" << ", " >> "])) != nil ->
+        translate_shift_at(expr, match, mode)
 
       # Additive
-      has_additive_op?(expr) ->
-        translate_additive(expr, mode)
+      (match = find_rightmost_op_outside_groups(expr, [" + ", " - "])) != nil ->
+        translate_additive_at(expr, match, mode)
 
       # Multiplicative
-      has_binary_op?(expr, [" * ", " / ", " % "]) ->
-        translate_multiplicative(expr, mode)
+      (match = find_rightmost_op_outside_groups(expr, [" * ", " / ", " % "])) != nil ->
+        translate_multiplicative_at(expr, match, mode)
 
       # Unary not
       String.starts_with?(expr, "not ") ->
-        inner = String.slice(expr, 4..-1//1) |> String.trim()
+        inner = binary_part(expr, 4, byte_size(expr) - 4) |> String.trim()
         "not (#{do_translate(inner, mode)})"
 
       # Unary negation (minus)
-      String.starts_with?(expr, "-") and String.length(expr) > 1 ->
-        inner = String.slice(expr, 1..-1//1) |> String.trim()
+      String.starts_with?(expr, "-") and byte_size(expr) > 1 ->
+        inner = binary_part(expr, 1, byte_size(expr) - 1) |> String.trim()
         if is_integer_literal?(inner) or is_float_literal?(inner) do
           "-#{inner}"
         else
@@ -67,12 +67,12 @@ defmodule Ksc.Expression do
 
       # Unary bitwise complement
       String.starts_with?(expr, "~") ->
-        inner = String.slice(expr, 1..-1//1) |> String.trim()
+        inner = binary_part(expr, 1, byte_size(expr) - 1) |> String.trim()
         "Bitwise.bnot(#{do_translate(inner, mode)})"
 
       # Parenthesized
       String.starts_with?(expr, "(") and matching_paren_at_end?(expr) ->
-        inner = String.slice(expr, 1..-2//1)
+        inner = binary_part(expr, 1, byte_size(expr) - 2)
         "(#{do_translate(inner, mode)})"
 
       # f-string (formatted string): f"abc={expr}" -> "abc=#{expr}"
@@ -118,8 +118,8 @@ defmodule Ksc.Expression do
         "#{mod_name}.__sizeof__()"
 
       # Method/field access: expr.method
-      has_dot_access?(expr) ->
-        translate_dot_access(expr, mode)
+      (dot_pos = find_last_dot(expr)) != nil ->
+        translate_dot_access_at(expr, dot_pos, mode)
 
       # Array index: expr[idx]
       has_array_access?(expr) ->
@@ -141,26 +141,25 @@ defmodule Ksc.Expression do
   end
 
   defp matching_paren_at_end?(expr) do
-    chars = String.graphemes(expr)
-    if hd(chars) != "(" or List.last(chars) != ")" do
+    len = byte_size(expr)
+    if len < 2 or :binary.at(expr, 0) != ?( or :binary.at(expr, len - 1) != ?) do
       false
     else
-      # Walk from position 1, tracking depth. If depth reaches 0 before the last char,
-      # the opening paren doesn't match the closing one.
-      inner = Enum.slice(chars, 1..-2//1)
-      {balanced, _} = Enum.reduce_while(inner, {true, 1}, fn ch, {_, depth} ->
-        new_depth = case ch do
-          "(" -> depth + 1
-          ")" -> depth - 1
-          _ -> depth
-        end
-        if new_depth == 0 do
-          {:halt, {false, 0}}
-        else
-          {:cont, {true, new_depth}}
-        end
-      end)
-      balanced
+      do_matching_paren(expr, len - 1, 1, 1)
+    end
+  end
+
+  defp do_matching_paren(_expr, max_idx, idx, _depth) when idx >= max_idx, do: true
+  defp do_matching_paren(expr, max_idx, idx, depth) do
+    new_depth = case :binary.at(expr, idx) do
+      ?( -> depth + 1
+      ?) -> depth - 1
+      _ -> depth
+    end
+    if new_depth == 0 do
+      false
+    else
+      do_matching_paren(expr, max_idx, idx + 1, new_depth)
     end
   end
 
@@ -218,47 +217,31 @@ defmodule Ksc.Expression do
     end
   end
 
-  defp has_ternary?(expr), do: find_operator_outside_groups(expr, " ? ") != nil
+  defp translate_ternary_at(expr, q_pos, mode) do
+    cond_part = binary_part(expr, 0, q_pos) |> String.trim()
+    rest = binary_part(expr, q_pos + 3, byte_size(expr) - q_pos - 3) |> String.trim()
 
-  defp translate_ternary(expr, mode) do
-    case find_operator_outside_groups(expr, " ? ") do
+    case find_operator_outside_groups(rest, " : ") do
       nil -> expr
-      pos ->
-        cond_part = String.slice(expr, 0, pos) |> String.trim()
-        rest = String.slice(expr, (pos + 3)..-1//1) |> String.trim()
-
-        case find_operator_outside_groups(rest, " : ") do
-          nil -> expr
-          colon_pos ->
-            true_part = String.slice(rest, 0, colon_pos) |> String.trim()
-            false_part = String.slice(rest, (colon_pos + 3)..-1//1) |> String.trim()
-            "if(#{do_translate(cond_part, mode)}, do: #{do_translate(true_part, mode)}, else: #{do_translate(false_part, mode)})"
-        end
+      colon_pos ->
+        true_part = binary_part(rest, 0, colon_pos) |> String.trim()
+        false_part = binary_part(rest, colon_pos + 3, byte_size(rest) - colon_pos - 3) |> String.trim()
+        "if(#{do_translate(cond_part, mode)}, do: #{do_translate(true_part, mode)}, else: #{do_translate(false_part, mode)})"
     end
   end
 
-  defp has_binary_op?(expr, ops) do
-    Enum.any?(ops, &(find_operator_outside_groups(expr, &1) != nil))
-  end
-
-  defp has_additive_op?(expr) do
-    find_operator_outside_groups(expr, " + ") != nil or
-      find_operator_outside_groups(expr, " - ") != nil
-  end
-
-  defp translate_binary_op(expr, ops, mode) do
-    {op, pos} = find_rightmost_op(expr, ops)
-    left = String.slice(expr, 0, pos) |> String.trim()
-    right = String.slice(expr, (pos + String.length(op))..-1//1) |> String.trim()
+  defp translate_binary_op_at(expr, {op, pos}, mode) do
+    op_len = byte_size(op)
+    left = binary_part(expr, 0, pos) |> String.trim()
+    right = binary_part(expr, pos + op_len, byte_size(expr) - pos - op_len) |> String.trim()
     elixir_op = String.trim(op)
     "(#{do_translate(left, mode)} #{elixir_op} #{do_translate(right, mode)})"
   end
 
-  defp translate_bitwise(expr, mode) do
-    ops = [" | ", " & ", " ^ "]
-    {op, pos} = find_rightmost_op(expr, ops)
-    left = String.slice(expr, 0, pos) |> String.trim()
-    right = String.slice(expr, (pos + String.length(op))..-1//1) |> String.trim()
+  defp translate_bitwise_at(expr, {op, pos}, mode) do
+    op_len = byte_size(op)
+    left = binary_part(expr, 0, pos) |> String.trim()
+    right = binary_part(expr, pos + op_len, byte_size(expr) - pos - op_len) |> String.trim()
 
     fn_name = case String.trim(op) do
       "|" -> "bor"
@@ -269,11 +252,10 @@ defmodule Ksc.Expression do
     "Bitwise.#{fn_name}(#{do_translate(left, mode)}, #{do_translate(right, mode)})"
   end
 
-  defp translate_shift(expr, mode) do
-    ops = [" << ", " >> "]
-    {op, pos} = find_rightmost_op(expr, ops)
-    left = String.slice(expr, 0, pos) |> String.trim()
-    right = String.slice(expr, (pos + String.length(op))..-1//1) |> String.trim()
+  defp translate_shift_at(expr, {op, pos}, mode) do
+    op_len = byte_size(op)
+    left = binary_part(expr, 0, pos) |> String.trim()
+    right = binary_part(expr, pos + op_len, byte_size(expr) - pos - op_len) |> String.trim()
 
     fn_name = case String.trim(op) do
       "<<" -> "bsl"
@@ -283,10 +265,10 @@ defmodule Ksc.Expression do
     "Bitwise.#{fn_name}(#{do_translate(left, mode)}, #{do_translate(right, mode)})"
   end
 
-  defp translate_additive(expr, mode) do
-    {op, pos} = find_rightmost_op(expr, [" + ", " - "])
-    left = String.slice(expr, 0, pos) |> String.trim()
-    right = String.slice(expr, (pos + String.length(op))..-1//1) |> String.trim()
+  defp translate_additive_at(expr, {op, pos}, mode) do
+    op_len = byte_size(op)
+    left = binary_part(expr, 0, pos) |> String.trim()
+    right = binary_part(expr, pos + op_len, byte_size(expr) - pos - op_len) |> String.trim()
 
     left_t = do_translate(left, mode)
     right_t = do_translate(right, mode)
@@ -304,11 +286,10 @@ defmodule Ksc.Expression do
     end
   end
 
-  defp translate_multiplicative(expr, mode) do
-    ops = [" * ", " / ", " % "]
-    {op, pos} = find_rightmost_op(expr, ops)
-    left = String.slice(expr, 0, pos) |> String.trim()
-    right = String.slice(expr, (pos + String.length(op))..-1//1) |> String.trim()
+  defp translate_multiplicative_at(expr, {op, pos}, mode) do
+    op_len = byte_size(op)
+    left = binary_part(expr, 0, pos) |> String.trim()
+    right = binary_part(expr, pos + op_len, byte_size(expr) - pos - op_len) |> String.trim()
 
     case String.trim(op) do
       "*" -> "(#{do_translate(left, mode)} * #{do_translate(right, mode)})"
@@ -317,137 +298,101 @@ defmodule Ksc.Expression do
     end
   end
 
-  defp translate_dot_access(expr, mode) do
-    case find_last_dot(expr) do
-      nil -> expr
-      pos ->
-        obj = String.slice(expr, 0, pos) |> String.trim()
-        method = String.slice(expr, (pos + 1)..-1//1) |> String.trim()
+  defp translate_dot_access_at(expr, dot_pos, mode) do
+    obj = binary_part(expr, 0, dot_pos) |> String.trim()
+    method = binary_part(expr, dot_pos + 1, byte_size(expr) - dot_pos - 1) |> String.trim()
 
-        case method do
-          "size" ->
-            if String.ends_with?(obj, "._io") do
-              # X._io.size -> size of the IO stream for X
-              inner = String.slice(obj, 0..-5//1)
-              "Ksc.Stream.kaitai_io_size(#{do_translate(inner, mode)})"
-            else
-              "Ksc.Stream.kaitai_size(#{do_translate(obj, mode)})"
-            end
-          "length" -> "Ksc.Stream.kaitai_length(#{do_translate(obj, mode)})"
-          "to_i" ->
-            # Check if the object is a cross-module enum reference (contains ::)
-            if String.contains?(obj, "::") do
-              parts = String.split(obj, "::")
-              value = List.last(parts) |> String.trim()
-              # Build module path for the enum's reverse map
-              # e.g., "enum_0::animal::cat" -> use @kaitai_enum_reverse from local (inherited enums)
-              "Ksc.Stream.to_i(:#{value}, @kaitai_enum_reverse)"
-            else
-              "Ksc.Stream.to_i(#{do_translate(obj, mode)}, @kaitai_enum_reverse)"
-            end
-          "to_s" -> "to_string(#{do_translate(obj, mode)})"
-          "to_f" -> "(#{do_translate(obj, mode)} / 1.0)"
-          "reverse" -> ":binary.bin_to_list(#{do_translate(obj, mode)}) |> Enum.reverse() |> :binary.list_to_bin()"
-          "first" -> "Ksc.Stream.kaitai_first(#{do_translate(obj, mode)})"
-          "last" -> "Ksc.Stream.kaitai_last(#{do_translate(obj, mode)})"
-          "min" -> "Ksc.Stream.kaitai_min(#{do_translate(obj, mode)})"
-          "max" -> "Ksc.Stream.kaitai_max(#{do_translate(obj, mode)})"
-          "as_s" -> "#{do_translate(obj, mode)}"
-          "_sizeof" ->
-            # field._sizeof -> if obj is a simple field access, look up from parent
-            # e.g. block1.a._sizeof -> result[:block1][:_sizeof_a] (parent stores field sizes)
-            # e.g. block1._sizeof -> result[:block1][:_sizeof] (map stores own sizeof)
-            case find_last_dot(obj) do
-              nil ->
-                # Simple field: e.g. block1._sizeof
-                translated_obj = do_translate(obj, mode)
-                "Ksc.Stream.kaitai_sizeof(#{translated_obj})"
-              parent_dot ->
-                parent_obj = String.slice(obj, 0, parent_dot) |> String.trim()
-                field_name = String.slice(obj, (parent_dot + 1)..-1//1) |> String.trim()
-                translated_parent = do_translate(parent_obj, mode)
-                # Try the field's own _sizeof first, fall back to parent's _sizeof_field
-                "(#{translated_parent}[:_sizeof_#{field_name}] || Ksc.Stream.kaitai_sizeof(#{translated_parent}[:#{field_name}]))"
-            end
-          "_io" ->
-            # ._io returns the object itself (it stores _io_data and _io_size)
+    case method do
+      "size" ->
+        if String.ends_with?(obj, "._io") do
+          # X._io.size -> size of the IO stream for X
+          inner = binary_part(obj, 0, byte_size(obj) - 4)
+          "Ksc.Stream.kaitai_io_size(#{do_translate(inner, mode)})"
+        else
+          "Ksc.Stream.kaitai_size(#{do_translate(obj, mode)})"
+        end
+      "length" -> "Ksc.Stream.kaitai_length(#{do_translate(obj, mode)})"
+      "to_i" ->
+        # Check if the object is a cross-module enum reference (contains ::)
+        if String.contains?(obj, "::") do
+          parts = String.split(obj, "::")
+          value = List.last(parts) |> String.trim()
+          # Build module path for the enum's reverse map
+          # e.g., "enum_0::animal::cat" -> use @kaitai_enum_reverse from local (inherited enums)
+          "Ksc.Stream.to_i(:#{value}, @kaitai_enum_reverse)"
+        else
+          "Ksc.Stream.to_i(#{do_translate(obj, mode)}, @kaitai_enum_reverse)"
+        end
+      "to_s" -> "to_string(#{do_translate(obj, mode)})"
+      "to_f" -> "(#{do_translate(obj, mode)} / 1.0)"
+      "reverse" -> ":binary.bin_to_list(#{do_translate(obj, mode)}) |> Enum.reverse() |> :binary.list_to_bin()"
+      "first" -> "Ksc.Stream.kaitai_first(#{do_translate(obj, mode)})"
+      "last" -> "Ksc.Stream.kaitai_last(#{do_translate(obj, mode)})"
+      "min" -> "Ksc.Stream.kaitai_min(#{do_translate(obj, mode)})"
+      "max" -> "Ksc.Stream.kaitai_max(#{do_translate(obj, mode)})"
+      "as_s" -> "#{do_translate(obj, mode)}"
+      "_sizeof" ->
+        # field._sizeof -> if obj is a simple field access, look up from parent
+        # e.g. block1.a._sizeof -> result[:block1][:_sizeof_a] (parent stores field sizes)
+        # e.g. block1._sizeof -> result[:block1][:_sizeof] (map stores own sizeof)
+        case find_last_dot(obj) do
+          nil ->
+            # Simple field: e.g. block1._sizeof
+            translated_obj = do_translate(obj, mode)
+            "Ksc.Stream.kaitai_sizeof(#{translated_obj})"
+          parent_dot ->
+            parent_obj = binary_part(obj, 0, parent_dot) |> String.trim()
+            field_name = binary_part(obj, parent_dot + 1, byte_size(obj) - parent_dot - 1) |> String.trim()
+            translated_parent = do_translate(parent_obj, mode)
+            # Try the field's own _sizeof first, fall back to parent's _sizeof_field
+            "(#{translated_parent}[:_sizeof_#{field_name}] || Ksc.Stream.kaitai_sizeof(#{translated_parent}[:#{field_name}]))"
+        end
+      "_io" ->
+        # ._io returns the object itself (it stores _io_data and _io_size)
+        do_translate(obj, mode)
+      _ ->
+        cond do
+          # .as<Type> cast - no-op in Elixir (dynamically typed)
+          String.starts_with?(method, "as<") ->
             do_translate(obj, mode)
-          _ ->
+          # .substring(from, to) -> binary_part(str, from, to - from)
+          String.starts_with?(method, "substring(") ->
+            args = String.trim_leading(method, "substring(") |> String.trim_trailing(")")
+            case String.split(args, ",") do
+              [from, to] ->
+                from_t = do_translate(String.trim(from), mode)
+                to_t = do_translate(String.trim(to), mode)
+                "binary_part(#{do_translate(obj, mode)}, #{from_t}, #{to_t} - #{from_t})"
+              _ ->
+                "#{do_translate(obj, mode)}"
+            end
+          # .to_i(base) -> String.to_integer(str, base)
+          String.starts_with?(method, "to_i(") ->
+            args = String.trim_leading(method, "to_i(") |> String.trim_trailing(")")
+            "String.to_integer(#{do_translate(obj, mode)}, #{do_translate(String.trim(args), mode)})"
+          # .to_s(encoding) -> just return the binary (encoding handled at parse time)
+          String.starts_with?(method, "to_s(") ->
+            do_translate(obj, mode)
+          true ->
+            translated_obj = do_translate(obj, mode)
+            # Field access on a parsed result - use map access
             cond do
-              # .as<Type> cast - no-op in Elixir (dynamically typed)
-              String.starts_with?(method, "as<") ->
-                do_translate(obj, mode)
-              # .substring(from, to) -> binary_part(str, from, to - from)
-              String.starts_with?(method, "substring(") ->
-                args = String.trim_leading(method, "substring(") |> String.trim_trailing(")")
-                case String.split(args, ",") do
-                  [from, to] ->
-                    from_t = do_translate(String.trim(from), mode)
-                    to_t = do_translate(String.trim(to), mode)
-                    "binary_part(#{do_translate(obj, mode)}, #{from_t}, #{to_t} - #{from_t})"
-                  _ ->
-                    "#{do_translate(obj, mode)}"
-                end
-              # .to_i(base) -> String.to_integer(str, base)
-              String.starts_with?(method, "to_i(") ->
-                args = String.trim_leading(method, "to_i(") |> String.trim_trailing(")")
-                "String.to_integer(#{do_translate(obj, mode)}, #{do_translate(String.trim(args), mode)})"
-              # .to_s(encoding) -> just return the binary (encoding handled at parse time)
-              String.starts_with?(method, "to_s(") ->
-                do_translate(obj, mode)
-              true ->
-                translated_obj = do_translate(obj, mode)
-                # Field access on a parsed result - use map access
-                cond do
-                  Regex.match?(~r/^[a-z_][a-zA-Z0-9_]*$/, method) ->
-                    "#{translated_obj}[:#{method}]"
-                  # Method part contains array access like "sizes[idx]" - split and handle
-                  Regex.match?(~r/^[a-z_][a-zA-Z0-9_]*\[/, method) ->
-                    # Re-translate the whole expression by first translating obj.field, then the array part
-                    case Regex.run(~r/^([a-z_][a-zA-Z0-9_]*)\[(.+)\]$/, method) do
-                      [_, field, idx_expr] ->
-                        "Ksc.Stream.kaitai_at(#{translated_obj}[:#{field}], #{do_translate(idx_expr, mode)})"
-                      nil ->
-                        "#{translated_obj}.#{method}"
-                    end
-                  true ->
+              Regex.match?(~r/^[a-z_][a-zA-Z0-9_]*$/, method) ->
+                "#{translated_obj}[:#{method}]"
+              # Method part contains array access like "sizes[idx]" - split and handle
+              Regex.match?(~r/^[a-z_][a-zA-Z0-9_]*\[/, method) ->
+                # Re-translate the whole expression by first translating obj.field, then the array part
+                case Regex.run(~r/^([a-z_][a-zA-Z0-9_]*)\[(.+)\]$/, method) do
+                  [_, field, idx_expr] ->
+                    "Ksc.Stream.kaitai_at(#{translated_obj}[:#{field}], #{do_translate(idx_expr, mode)})"
+                  nil ->
                     "#{translated_obj}.#{method}"
                 end
+              true ->
+                "#{translated_obj}.#{method}"
             end
         end
     end
-  end
-
-  defp has_dot_access?(expr), do: find_last_dot(expr) != nil
-
-  defp find_last_dot(expr) do
-    chars = String.graphemes(expr)
-    len = length(chars)
-
-    result =
-      Enum.reduce(Enum.with_index(chars), {nil, 0, 0, false}, fn {ch, idx}, {last_dot, pd, bd, ins} ->
-        {new_ins, new_pd, new_bd} =
-          case ch do
-            "\"" -> {!ins, pd, bd}
-            "(" when not ins -> {false, pd + 1, bd}
-            ")" when not ins -> {false, max(pd - 1, 0), bd}
-            "[" when not ins -> {false, pd, bd + 1}
-            "]" when not ins -> {false, pd, max(bd - 1, 0)}
-            _ -> {ins, pd, bd}
-          end
-
-        new_last_dot =
-          if ch == "." and not new_ins and new_pd == 0 and new_bd == 0 and idx + 1 < len do
-            next_ch = Enum.at(chars, idx + 1)
-            if next_ch != nil and Regex.match?(~r/[a-zA-Z_]/, next_ch), do: idx, else: last_dot
-          else
-            last_dot
-          end
-
-        {new_last_dot, new_pd, new_bd, new_ins}
-      end)
-
-    elem(result, 0)
   end
 
   defp has_array_access?(expr) do
@@ -459,30 +404,9 @@ defmodule Ksc.Expression do
     case find_matching_bracket_from_end(expr) do
       nil -> expr
       bracket_pos ->
-        obj = String.slice(expr, 0, bracket_pos) |> String.trim()
-        idx_expr = String.slice(expr, (bracket_pos + 1)..-2//1) |> String.trim()
+        obj = binary_part(expr, 0, bracket_pos) |> String.trim()
+        idx_expr = binary_part(expr, bracket_pos + 1, byte_size(expr) - bracket_pos - 2) |> String.trim()
         "Ksc.Stream.kaitai_at(#{do_translate(obj, mode)}, #{do_translate(idx_expr, mode)})"
-    end
-  end
-
-  defp find_matching_bracket_from_end(expr) do
-    chars = String.graphemes(expr)
-    len = length(chars)
-
-    if Enum.at(chars, len - 1) == "]" do
-      {pos, _} =
-        Enum.reduce_while((len - 1)..0//-1, {nil, 0}, fn idx, {_, depth} ->
-          case Enum.at(chars, idx) do
-            "]" -> {:cont, {nil, depth + 1}}
-            "[" ->
-              new_depth = depth - 1
-              if new_depth == 0, do: {:halt, {idx, 0}}, else: {:cont, {nil, new_depth}}
-            _ -> {:cont, {nil, depth}}
-          end
-        end)
-      pos
-    else
-      nil
     end
   end
 
@@ -549,80 +473,139 @@ defmodule Ksc.Expression do
     end
   end
 
-  defp find_operator_outside_groups(expr, op) do
-    op_len = String.length(op)
-    chars = String.graphemes(expr)
-    len = length(chars)
-
-    if len < op_len do
+  # Single-pass scan for the rightmost operator among `ops`, respecting grouping.
+  # Returns {op, pos} or nil.
+  defp find_rightmost_op_outside_groups(expr, ops) do
+    len = byte_size(expr)
+    op_specs = Enum.map(ops, fn op -> {op, byte_size(op)} end)
+    min_op_len = op_specs |> Enum.map(&elem(&1, 1)) |> Enum.min()
+    if len < min_op_len do
       nil
     else
-      Enum.reduce_while(0..(len - op_len), {nil, 0, 0, false}, fn idx, {_, pd, bd, ins} ->
-        ch = Enum.at(chars, idx)
-
-        {new_ins, new_pd, new_bd} =
-          case ch do
-            "\"" -> {!ins, pd, bd}
-            "(" when not ins -> {false, pd + 1, bd}
-            ")" when not ins -> {false, max(pd - 1, 0), bd}
-            "[" when not ins -> {false, pd, bd + 1}
-            "]" when not ins -> {false, pd, max(bd - 1, 0)}
-            _ -> {ins, pd, bd}
-          end
-
-        if not new_ins and new_pd == 0 and new_bd == 0 do
-          if String.slice(expr, idx, op_len) == op do
-            {:halt, {idx, new_pd, new_bd, new_ins}}
-          else
-            {:cont, {nil, new_pd, new_bd, new_ins}}
-          end
-        else
-          {:cont, {nil, new_pd, new_bd, new_ins}}
-        end
-      end)
-      |> elem(0)
+      do_find_rightmost(expr, len, op_specs, 0, 0, 0, false, nil)
     end
   end
 
-  defp find_rightmost_op(expr, ops) do
-    results =
-      Enum.flat_map(ops, fn op ->
-        find_all_positions(expr, op) |> Enum.map(&{op, &1})
-      end)
-
-    if results == [], do: {nil, nil}, else: Enum.max_by(results, &elem(&1, 1))
-  end
-
-  defp find_all_positions(expr, op) do
-    op_len = String.length(op)
-    chars = String.graphemes(expr)
-    len = length(chars)
-
-    if len < op_len do
-      []
+  defp do_find_rightmost(expr, len, op_specs, idx, pd, bd, ins, acc) do
+    if idx >= len do
+      acc
     else
-      {positions, _, _, _} =
-        Enum.reduce(0..(len - op_len), {[], 0, 0, false}, fn idx, {acc, pd, bd, ins} ->
-          ch = Enum.at(chars, idx)
+      ch = :binary.at(expr, idx)
 
-          {new_ins, new_pd, new_bd} =
-            case ch do
-              "\"" -> {!ins, pd, bd}
-              "(" when not ins -> {false, pd + 1, bd}
-              ")" when not ins -> {false, max(pd - 1, 0), bd}
-              "[" when not ins -> {false, pd, bd + 1}
-              "]" when not ins -> {false, pd, max(bd - 1, 0)}
-              _ -> {ins, pd, bd}
-            end
+      {new_ins, new_pd, new_bd} = case ch do
+        ?\" -> {not ins, pd, bd}
+        ?( when not ins -> {false, pd + 1, bd}
+        ?) when not ins -> {false, max(pd - 1, 0), bd}
+        ?[ when not ins -> {false, pd, bd + 1}
+        ?] when not ins -> {false, pd, max(bd - 1, 0)}
+        _ -> {ins, pd, bd}
+      end
 
-          if not new_ins and new_pd == 0 and new_bd == 0 and String.slice(expr, idx, op_len) == op do
-            {[idx | acc], new_pd, new_bd, new_ins}
+      new_acc = if not new_ins and new_pd == 0 and new_bd == 0 do
+        Enum.reduce(op_specs, acc, fn {op, op_len}, best ->
+          if idx + op_len <= len and :binary.part(expr, idx, op_len) == op do
+            {op, idx}
           else
-            {acc, new_pd, new_bd, new_ins}
+            best
           end
         end)
+      else
+        acc
+      end
 
-      Enum.reverse(positions)
+      do_find_rightmost(expr, len, op_specs, idx + 1, new_pd, new_bd, new_ins, new_acc)
+    end
+  end
+
+  # Leftmost scan for a single operator outside groups. Returns position or nil.
+  defp find_operator_outside_groups(expr, op) do
+    op_len = byte_size(op)
+    len = byte_size(expr)
+    if len < op_len do
+      nil
+    else
+      do_find_operator(expr, op, op_len, len, 0, 0, 0, false)
+    end
+  end
+
+  defp do_find_operator(expr, op, op_len, len, idx, pd, bd, ins) do
+    if idx + op_len > len do
+      nil
+    else
+      ch = :binary.at(expr, idx)
+
+      {new_ins, new_pd, new_bd} = case ch do
+        ?\" -> {not ins, pd, bd}
+        ?( when not ins -> {false, pd + 1, bd}
+        ?) when not ins -> {false, max(pd - 1, 0), bd}
+        ?[ when not ins -> {false, pd, bd + 1}
+        ?] when not ins -> {false, pd, max(bd - 1, 0)}
+        _ -> {ins, pd, bd}
+      end
+
+      if not new_ins and new_pd == 0 and new_bd == 0 and :binary.part(expr, idx, op_len) == op do
+        idx
+      else
+        do_find_operator(expr, op, op_len, len, idx + 1, new_pd, new_bd, new_ins)
+      end
+    end
+  end
+
+  # Byte-level scan for the last dot that precedes a letter/underscore, outside groups.
+  defp find_last_dot(expr) do
+    len = byte_size(expr)
+    do_find_last_dot(expr, len, 0, 0, 0, false, nil)
+  end
+
+  defp do_find_last_dot(expr, len, idx, pd, bd, ins, acc) do
+    if idx >= len do
+      acc
+    else
+      ch = :binary.at(expr, idx)
+
+      {new_ins, new_pd, new_bd} = case ch do
+        ?\" -> {not ins, pd, bd}
+        ?( when not ins -> {false, pd + 1, bd}
+        ?) when not ins -> {false, max(pd - 1, 0), bd}
+        ?[ when not ins -> {false, pd, bd + 1}
+        ?] when not ins -> {false, pd, max(bd - 1, 0)}
+        _ -> {ins, pd, bd}
+      end
+
+      new_acc =
+        if ch == ?. and not new_ins and new_pd == 0 and new_bd == 0 and idx + 1 < len do
+          next_ch = :binary.at(expr, idx + 1)
+          if (next_ch >= ?a and next_ch <= ?z) or (next_ch >= ?A and next_ch <= ?Z) or next_ch == ?_ do
+            idx
+          else
+            acc
+          end
+        else
+          acc
+        end
+
+      do_find_last_dot(expr, len, idx + 1, new_pd, new_bd, new_ins, new_acc)
+    end
+  end
+
+  # Byte-level reverse scan for matching bracket from end.
+  defp find_matching_bracket_from_end(expr) do
+    len = byte_size(expr)
+    if len == 0 or :binary.at(expr, len - 1) != ?] do
+      nil
+    else
+      do_find_matching_bracket(expr, len - 1, 0)
+    end
+  end
+
+  defp do_find_matching_bracket(_expr, idx, _depth) when idx < 0, do: nil
+  defp do_find_matching_bracket(expr, idx, depth) do
+    case :binary.at(expr, idx) do
+      ?] -> do_find_matching_bracket(expr, idx - 1, depth + 1)
+      ?[ ->
+        new_depth = depth - 1
+        if new_depth == 0, do: idx, else: do_find_matching_bracket(expr, idx - 1, new_depth)
+      _ -> do_find_matching_bracket(expr, idx - 1, depth)
     end
   end
 end

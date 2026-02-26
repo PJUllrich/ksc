@@ -41,8 +41,9 @@ defmodule ValidateAllTest do
     ensure_opaque_types_loaded(ksy_path)
 
     # Phase 1: Compile
+    ns = "VT#{:erlang.unique_integer([:positive])}"
     {compile_result, source} = try do
-      {:ok, src} = Ksc.compile(ksy_path)
+      {:ok, src} = Ksc.compile(ksy_path, namespace: ns)
       {:ok, src}
     rescue
       e -> {:compile_error, Exception.message(e)}
@@ -117,7 +118,8 @@ defmodule ValidateAllTest do
           mod_name = type |> Macro.camelize()
           unless Code.ensure_loaded?(String.to_atom("Elixir.#{mod_name}")) do
             try do
-              Ksc.compile_and_load(dep_ksy)
+              dep_ns = "VTDep#{:erlang.unique_integer([:positive])}"
+              Ksc.compile_and_load(dep_ksy, namespace: dep_ns)
             rescue
               _ -> :ok
             end

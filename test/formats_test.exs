@@ -5,7 +5,8 @@ defmodule FormatsTest do
   @fixtures_dir "reference_code/kaitai_struct_tests/src"
 
   defp compile_and_parse(ksy_name, bin_name) do
-    {:ok, mod} = Ksc.compile_and_load(Path.join(@formats_dir, "#{ksy_name}.ksy"))
+    ns = "FT#{:erlang.unique_integer([:positive])}"
+    {:ok, mod} = Ksc.compile_and_load(Path.join(@formats_dir, "#{ksy_name}.ksy"), namespace: ns)
     mod.from_file(Path.join(@fixtures_dir, bin_name))
   end
 

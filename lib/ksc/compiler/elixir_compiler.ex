@@ -46,7 +46,7 @@ defmodule Ksc.Compiler.ElixirCompiler do
     # Merge this module's enums with inherited ones
     all_enums = Map.merge(all_enums, spec.enums)
 
-    enum_code = compile_enums(all_enums)
+    {enum_defs, enum_reverse_attr} = compile_enums(all_enums)
 
     nested_modules =
       Enum.map(spec.types, fn {name, type_spec} ->
@@ -88,13 +88,22 @@ defmodule Ksc.Compiler.ElixirCompiler do
     sizeof_fn = compile_sizeof(spec, endian)
 
     body_parts =
-      [enum_code | nested_modules] ++ [public_api, parse_fn | instance_fns] ++ [sizeof_fn]
+      [enum_defs | nested_modules] ++ [public_api, parse_fn | instance_fns] ++ [sizeof_fn]
 
     body =
       body_parts
       |> Enum.reject(&is_nil/1)
       |> Enum.reject(&(&1 == ""))
       |> Enum.join("\n\n")
+
+    # Only include @kaitai_enum_reverse if the body actually references it
+    body =
+      if String.contains?(body, "@kaitai_enum_reverse") do
+        reverse_line = if enum_reverse_attr != "", do: enum_reverse_attr, else: "@kaitai_enum_reverse %{}"
+        reverse_line <> "\n" <> body
+      else
+        body
+      end
 
     short_name = mod_name |> String.split(".") |> List.last()
 
@@ -376,13 +385,6 @@ defmodule Ksc.Compiler.ElixirCompiler do
           nil
         end
 
-      io_pos_code =
-        if needs_io do
-          "io_pos = io_size - byte_size(rest)"
-        else
-          nil
-        end
-
       parent_init =
         if needs_parent_passing,
           do:
@@ -439,7 +441,7 @@ defmodule Ksc.Compiler.ElixirCompiler do
         end
 
       body_lines =
-        [io_init, parent_init, root_init, is_le_init, debug_init, body, io_pos_code]
+        [parent_init, root_init, is_le_init, debug_init, body]
         |> Enum.reject(&is_nil/1)
         |> Enum.join("\n")
 
@@ -447,6 +449,14 @@ defmodule Ksc.Compiler.ElixirCompiler do
       body_lines =
         if needs_io do
           insert_io_pos_updates(body_lines)
+        else
+          body_lines
+        end
+
+      # Only prepend io_size initialization if the body actually uses it
+      body_lines =
+        if io_init != nil and String.contains?(body_lines, "io_size") do
+          io_init <> "\n" <> body_lines
         else
           body_lines
         end
@@ -799,7 +809,6 @@ defmodule Ksc.Compiler.ElixirCompiler do
                 end
 
               """
-              #{var}_data = rest
               {#{var}, rest} = #{type_mod}.parse(rest, #{root_ref}, #{inline_parent}#{args_str})#{resolve_line}
               """
               |> String.trim()
@@ -988,38 +997,81 @@ defmodule Ksc.Compiler.ElixirCompiler do
         ""
       end
 
+    # Check if inner code uses _index
+    needs_index = String.contains?(inner_code, "var__index")
+
     if spec.ks_debug do
-      """
-      {#{var}, rest} = try do
-        Enum.reduce(Enum.with_index(1..max(#{count}, 0)//1), {[], rest}, fn {_, var__index}, {acc, rest} ->
-          try do
-            #{update_parent}#{Utils.indent(inner_code, 2)}
-            {acc ++ [item], rest}
-          rescue
-            _ ->
-              partial = Process.get(:_kaitai_debug_partial)
-              Process.put(:_kaitai_debug_partial, nil)
-              Process.put(:_kaitai_debug_rest, nil)
-              if partial != nil do
-                throw({:partial_array, acc ++ [partial], rest})
-              else
-                throw({:partial_array, acc, rest})
-              end
-          end
-        end)
-      catch
-        {:partial_array, partial, partial_rest} -> {partial, partial_rest}
+      if needs_index do
+        """
+        {#{var}, rest} = try do
+          Enum.reduce(Enum.with_index(1..max(#{count}, 0)//1), {[], rest}, fn {_, var__index}, {acc, rest} ->
+            try do
+              #{update_parent}#{Utils.indent(inner_code, 2)}
+              {[item | acc], rest}
+            rescue
+              _ ->
+                partial = Process.get(:_kaitai_debug_partial)
+                Process.put(:_kaitai_debug_partial, nil)
+                Process.put(:_kaitai_debug_rest, nil)
+                if partial != nil do
+                  throw({:partial_array, [partial | acc], rest})
+                else
+                  throw({:partial_array, acc, rest})
+                end
+            end
+          end)
+        catch
+          {:partial_array, partial, partial_rest} -> {partial, partial_rest}
+        end
+        #{var} = Enum.reverse(#{var})
+        """
+        |> String.trim()
+      else
+        """
+        {#{var}, rest} = try do
+          Enum.reduce(1..max(#{count}, 0)//1, {[], rest}, fn _, {acc, rest} ->
+            try do
+              #{update_parent}#{Utils.indent(inner_code, 2)}
+              {[item | acc], rest}
+            rescue
+              _ ->
+                partial = Process.get(:_kaitai_debug_partial)
+                Process.put(:_kaitai_debug_partial, nil)
+                Process.put(:_kaitai_debug_rest, nil)
+                if partial != nil do
+                  throw({:partial_array, [partial | acc], rest})
+                else
+                  throw({:partial_array, acc, rest})
+                end
+            end
+          end)
+        catch
+          {:partial_array, partial, partial_rest} -> {partial, partial_rest}
+        end
+        #{var} = Enum.reverse(#{var})
+        """
+        |> String.trim()
       end
-      """
-      |> String.trim()
     else
-      """
-      {#{var}, rest} = Enum.reduce(Enum.with_index(1..max(#{count}, 0)//1), {[], rest}, fn {_, var__index}, {acc, rest} ->
-        #{update_parent}#{Utils.indent(inner_code, 1)}
-        {acc ++ [item], rest}
-      end)
-      """
-      |> String.trim()
+      if needs_index do
+        """
+        {#{var}, rest} = Enum.reduce(Enum.with_index(1..max(#{count}, 0)//1), {[], rest}, fn {_, var__index}, {acc, rest} ->
+          #{update_parent}#{Utils.indent(inner_code, 1)}
+          {[item | acc], rest}
+        end)
+        #{var} = Enum.reverse(#{var})
+        """
+        |> String.trim()
+      else
+        """
+        {#{var}, rest} = Enum.reduce(1..max(#{count}, 0)//1, {[], rest}, fn _, {acc, rest} ->
+          #{update_parent}#{Utils.indent(inner_code, 1)}
+          {[item | acc], rest}
+        end)
+        #{var} = Enum.reverse(#{var})
+        """
+        |> String.trim()
+      end
     end
   end
 
@@ -1337,32 +1389,42 @@ defmodule Ksc.Compiler.ElixirCompiler do
     if assignments == "" do
       "def resolve_instances(result, _root_data), do: result"
     else
-      # Add io_size/io_pos initialization if any instance references _io
-      needs_io =
-        String.contains?(assignments, "io_size") or String.contains?(assignments, "io_pos")
+      # Add io_size/io_pos initialization independently if referenced (use word boundary to avoid _io_pos/_io_size)
+      needs_io_size = Regex.match?(~r/(?<![_\w])io_size\b/, assignments)
+      needs_io_pos = Regex.match?(~r/(?<![_\w])io_pos\b/, assignments)
 
-      io_init =
-        if needs_io do
-          "io_size = byte_size(root_data)\nio_pos = result[:_io_pos] || 0"
-        else
-          nil
-        end
+      io_size_init = if needs_io_size, do: "io_size = byte_size(root_data)", else: nil
+      io_pos_init = if needs_io_pos, do: "io_pos = result[:_io_pos] || 0", else: nil
 
-      # Extract parent_ and root_ from result if instances reference them
+      # Extract parent_ and root_ from result if instances reference them (use word boundary to avoid root_data, :_root)
       needs_parent = String.contains?(assignments, "parent_")
-      needs_root = String.contains?(assignments, "root_")
+      needs_root = Regex.match?(~r/(?<![_:\w])root_(?!data)/, assignments) or needs_root_refresh
       needs_is_le = String.contains?(assignments, "var__is_le")
       parent_init = if needs_parent, do: "parent_ = result[:_parent]", else: nil
       root_init = if needs_root, do: "root_ = result[:_root] || result", else: nil
       is_le_init = if needs_is_le, do: "var__is_le = result[:_is_le]", else: nil
 
-      body =
-        [io_init, parent_init, root_init, is_le_init, assignments]
+      # Suppress unused variable warnings for variables that may be set but not read after the last assignment
+      suppress =
+        [
+          if(root_init, do: "_ = root_"),
+          if(io_pos_init, do: "_ = io_pos"),
+          if(io_size_init, do: "_ = io_size")
+        ]
         |> Enum.reject(&is_nil/1)
         |> Enum.join("\n")
 
+      suppress_line = if suppress != "", do: suppress, else: nil
+
+      body =
+        [io_size_init, io_pos_init, parent_init, root_init, is_le_init, assignments, suppress_line]
+        |> Enum.reject(&is_nil/1)
+        |> Enum.join("\n")
+
+      root_data_param = if String.contains?(body, "root_data"), do: "root_data", else: "_root_data"
+
       """
-      def resolve_instances(result, root_data) do
+      def resolve_instances(result, #{root_data_param}) do
         #{body}
         result
       end
@@ -1412,8 +1474,8 @@ defmodule Ksc.Compiler.ElixirCompiler do
         inst_items = Enum.reduce(1..max(inst_count_, 0)//1, {[], #{remaining_expr}}, fn _, {acc, inst_rest} ->
           <<item_data::binary-size(inst_size_), inst_rest::binary>> = inst_rest
           {item, _} = #{type_mod}.parse(item_data, result)#{resolve_line}
-          {acc ++ [item], inst_rest}
-        end) |> elem(0)
+          {[item | acc], inst_rest}
+        end) |> elem(0) |> Enum.reverse()
         result = Map.put(result, :#{name}, inst_items)
         """
         |> String.trim()
@@ -1427,8 +1489,8 @@ defmodule Ksc.Compiler.ElixirCompiler do
         inst_count_ = #{count_expr}
         inst_items = Enum.reduce(1..max(inst_count_, 0)//1, {[], #{remaining_expr}}, fn _, {acc, inst_rest} ->
           {item, inst_rest} = #{type_mod}.parse(inst_rest, result)#{resolve_line}
-          {acc ++ [item], inst_rest}
-        end) |> elem(0)
+          {[item | acc], inst_rest}
+        end) |> elem(0) |> Enum.reverse()
         result = Map.put(result, :#{name}, inst_items)
         """
         |> String.trim()
@@ -1442,8 +1504,8 @@ defmodule Ksc.Compiler.ElixirCompiler do
       inst_size_ = #{size_expr}
       inst_items = Enum.reduce(1..max(inst_count_, 0)//1, {[], #{remaining_expr}}, fn _, {acc, inst_rest} ->
         <<item::binary-size(inst_size_), inst_rest::binary>> = inst_rest
-        {acc ++ [item], inst_rest}
-      end) |> elem(0)
+        {[item | acc], inst_rest}
+      end) |> elem(0) |> Enum.reverse()
       result = Map.put(result, :#{name}, inst_items)
       """
       |> String.trim()
@@ -1974,7 +2036,7 @@ defmodule Ksc.Compiler.ElixirCompiler do
   defp maybe_apply_process(code, _attr, _var), do: code
 
   defp compile_enums(enums) when map_size(enums) == 0 do
-    "@kaitai_enum_reverse %{}"
+    {"", ""}
   end
 
   defp compile_enums(enums) do
@@ -1995,7 +2057,7 @@ defmodule Ksc.Compiler.ElixirCompiler do
       end)
       |> Enum.join(", ")
 
-    enum_defs <> "\n@kaitai_enum_reverse %{#{reverse_entries}}"
+    {enum_defs, "@kaitai_enum_reverse %{#{reverse_entries}}"}
   end
 
   defp translate_expr(nil), do: "nil"
@@ -2060,6 +2122,8 @@ defmodule Ksc.Compiler.ElixirCompiler do
     # bits_state's internal data instead of rest for accurate byte position.
     # Also replace (io_pos >= io_size) EOF check with bits-aware version in bit runs.
     lines = String.split(body, "\n")
+    # Match io_pos as a standalone variable (not io_pos_done_ or _io_pos)
+    io_pos_re = ~r/(?<![_\w])io_pos(?![_\w])/
 
     {result, _in_bits} =
       Enum.reduce(lines, {[], false}, fn line, {acc, in_bits} ->
@@ -2072,7 +2136,7 @@ defmodule Ksc.Compiler.ElixirCompiler do
           String.starts_with?(trimmed, "rest = Ksc.Stream.align_to_byte(bits_state)") ->
             {acc ++ [line], false}
 
-          String.contains?(line, "io_pos") and not String.starts_with?(trimmed, "io_pos =") and
+          Regex.match?(io_pos_re, line) and not String.starts_with?(trimmed, "io_pos =") and
               not String.starts_with?(trimmed, "io_size =") ->
             # In bit context, replace EOF check with bits-aware version
             line =
@@ -2086,14 +2150,32 @@ defmodule Ksc.Compiler.ElixirCompiler do
                 line
               end
 
-            pos_expr =
-              if in_bits do
-                "io_pos = io_size - byte_size(elem(bits_state, 2))"
-              else
-                "io_pos = io_size - byte_size(rest)"
-              end
+            # After replacement, check if io_pos is still referenced
+            if Regex.match?(io_pos_re, line) do
+              pos_expr =
+                if in_bits do
+                  "io_pos = io_size - byte_size(elem(bits_state, 2))"
+                else
+                  "io_pos = io_size - byte_size(rest)"
+                end
 
-            {acc ++ [pos_expr, line], in_bits}
+              # Skip inserting if the previous line is already an io_pos assignment (avoid redundant assignments)
+              prev_is_io_pos =
+                case List.last(acc) do
+                  nil -> false
+                  prev -> String.starts_with?(String.trim(prev), "io_pos =")
+                end
+
+              if prev_is_io_pos do
+                # Replace the previous io_pos assignment with the new one
+                {List.delete_at(acc, -1) ++ [pos_expr, line], in_bits}
+              else
+                {acc ++ [pos_expr, line], in_bits}
+              end
+            else
+              # io_pos was fully replaced (e.g., bits-aware EOF check), no assignment needed
+              {acc ++ [line], in_bits}
+            end
 
           true ->
             {acc ++ [line], in_bits}
@@ -2193,8 +2275,8 @@ defmodule Ksc.Compiler.ElixirCompiler do
         args_str =
           if args != [], do: ", " <> Enum.map_join(args, ", ", &translate_expr/1), else: ""
 
-        "_process = #{mod_name}.new(#{String.trim_leading(args_str, ", ")})\n" <>
-          "#{var} = #{mod_name}.decode(_process, #{var})"
+        "process = #{mod_name}.new(#{String.trim_leading(args_str, ", ")})\n" <>
+          "#{var} = #{mod_name}.decode(process, #{var})"
     end
   end
 

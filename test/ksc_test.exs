@@ -9,7 +9,8 @@ defmodule KscTest do
   end
 
   test "compile_and_load/1 returns module atom" do
-    {:ok, mod} = Ksc.compile_and_load("reference_code/kaitai_struct_tests/formats/hello_world.ksy")
+    ns = "KT#{:erlang.unique_integer([:positive])}"
+    {:ok, mod} = Ksc.compile_and_load("reference_code/kaitai_struct_tests/formats/hello_world.ksy", namespace: ns)
     assert is_atom(mod)
     assert function_exported?(mod, :from_file, 1)
     assert function_exported?(mod, :from_binary, 1)
@@ -24,7 +25,8 @@ defmodule KscTest do
         type: u1
     """
 
-    {:ok, mod} = Ksc.compile_string_and_load(yaml)
+    ns = "KST#{:erlang.unique_integer([:positive])}"
+    {:ok, mod} = Ksc.compile_string_and_load(yaml, namespace: ns)
     result = mod.from_binary(<<42>>)
     assert result.val == 42
   end

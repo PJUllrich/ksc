@@ -10,21 +10,30 @@ defmodule Ksc do
 
   @doc """
   Compile a .ksy file into an Elixir source code string.
+
+  Options:
+    - `:namespace` — module namespace prefix to apply to all generated modules
   """
-  def compile(ksy_path) do
-    spec = Parser.parse_file(ksy_path)
-    formats_dir = Path.dirname(ksy_path)
+  def compile(ksy_path, opts \\ []) do
+    module_pairs =
+      ksy_path
+      |> compile_modules()
+      |> Enum.uniq_by(fn {name, _} -> name end)
 
-    # Collect enums from imported modules
-    imported_enums = collect_imported_enums(spec.imports, formats_dir, formats_dir)
-    # Merge imported enums into main spec
-    merged_spec = %{spec | enums: Map.merge(imported_enums, spec.enums)}
+    namespace = opts[:namespace]
 
-    # Compile imported types first, passing merged enums for cross-module enum resolution
-    import_sources = compile_imports(spec.imports, formats_dir, formats_dir, [], merged_spec.enums)
+    source =
+      if namespace do
+        all_mod_names = Enum.map(module_pairs, fn {name, _} -> name end)
 
-    source = ElixirCompiler.compile(merged_spec)
-    {:ok, Enum.join(import_sources ++ [source], "\n\n")}
+        Enum.map_join(module_pairs, "\n\n", fn {name, src} ->
+          apply_namespace(src, name, all_mod_names, namespace)
+        end)
+      else
+        Enum.map_join(module_pairs, "\n\n", fn {_name, src} -> src end)
+      end
+
+    {:ok, source}
   end
 
   defp collect_imported_enums(imports, dir, root_dir) do
@@ -48,34 +57,6 @@ defmodule Ksc do
         end
       end
     end)
-  end
-
-  defp compile_imports(imports, dir, root_dir, acc, parent_enums) do
-    compile_imports(imports, dir, root_dir, acc, MapSet.new(), parent_enums)
-  end
-
-  defp compile_imports([], _dir, _root_dir, acc, _seen, _parent_enums), do: Enum.reverse(acc)
-  defp compile_imports([imp | rest], dir, root_dir, acc, seen, parent_enums) do
-    {imp_name, resolve_dir} = resolve_import_dir(imp, dir, root_dir)
-
-    if MapSet.member?(seen, imp_name) do
-      compile_imports(rest, dir, root_dir, acc, seen, parent_enums)
-    else
-      seen = MapSet.put(seen, imp_name)
-      ksy_path = find_import(imp_name, resolve_dir)
-
-      if ksy_path && File.exists?(ksy_path) do
-        spec = Parser.parse_file(ksy_path)
-        merged_enums = Map.merge(parent_enums, spec.enums)
-        spec = %{spec | enums: merged_enums}
-        sub_dir = Path.dirname(ksy_path)
-        sub_imports = compile_imports(spec.imports, sub_dir, root_dir, [], seen, merged_enums)
-        source = ElixirCompiler.compile(spec)
-        compile_imports(rest, dir, root_dir, [source | sub_imports] ++ acc, seen, parent_enums)
-      else
-        compile_imports(rest, dir, root_dir, acc, seen, parent_enums)
-      end
-    end
   end
 
   # Absolute imports (starting with /) resolve from root_dir; relative from current dir
@@ -214,9 +195,12 @@ defmodule Ksc do
   @doc """
   Compile a .ksy file and load the resulting module into the VM.
   Returns {:ok, module_atom} on success.
+
+  Options:
+    - `:namespace` — module namespace prefix to apply to all generated modules
   """
-  def compile_and_load(ksy_path) do
-    case compile(ksy_path) do
+  def compile_and_load(ksy_path, opts \\ []) do
+    case compile(ksy_path, opts) do
       {:ok, source} ->
         modules = Code.compile_string(source)
         # The last module compiled is the top-level one
@@ -230,10 +214,23 @@ defmodule Ksc do
 
   @doc """
   Compile a KSY YAML string and load the resulting module.
+
+  Options:
+    - `:namespace` — module namespace prefix to apply to the generated module
   """
-  def compile_string_and_load(yaml_string) do
+  def compile_string_and_load(yaml_string, opts \\ []) do
     spec = Parser.parse_string(yaml_string)
     source = ElixirCompiler.compile(spec)
+    namespace = opts[:namespace]
+
+    source =
+      if namespace do
+        mod_name = Ksc.Compiler.Utils.to_module_name(spec.id)
+        apply_namespace(source, mod_name, [mod_name], namespace)
+      else
+        source
+      end
+
     modules = Code.compile_string(source)
     {module, _binary} = List.last(modules)
     {:ok, module}
