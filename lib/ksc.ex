@@ -97,6 +97,120 @@ defmodule Ksc do
     end
   end
 
+  @default_namespace "Ksc.Compiled"
+
+  @doc """
+  Compile one or more .ksy files and write each top-level module as a separate .ex file.
+
+  - `input_path` — a single `.ksy` file or a directory containing `.ksy` files
+  - `output_dir` — directory where `.ex` files are written (created if it doesn't exist)
+  - `opts` — keyword list of options:
+    - `:namespace` — module namespace prefix (default: `"Ksc.Compiled"`)
+
+  Returns `{:ok, [written_file_paths]}` or `{:error, reason}`.
+  """
+  def compile_to_files(input_path, output_dir, opts \\ []) do
+    namespace = Keyword.get(opts, :namespace, @default_namespace)
+
+    ksy_files =
+      cond do
+        File.dir?(input_path) ->
+          Path.wildcard(Path.join(input_path, "**/*.ksy"))
+
+        String.ends_with?(input_path, ".ksy") && File.exists?(input_path) ->
+          [input_path]
+
+        true ->
+          :error
+      end
+
+    case ksy_files do
+      :error ->
+        {:error, "#{input_path} is not a .ksy file or directory"}
+
+      [] ->
+        {:error, "no .ksy files found in #{input_path}"}
+
+      files ->
+        File.mkdir_p!(output_dir)
+
+        modules =
+          files
+          |> Enum.flat_map(&compile_modules/1)
+          |> Enum.uniq_by(fn {mod_name, _source} -> mod_name end)
+
+        all_mod_names = Enum.map(modules, fn {name, _} -> name end)
+
+        written =
+          Enum.map(modules, fn {mod_name, source} ->
+            source = apply_namespace(source, mod_name, all_mod_names, namespace)
+            filename = Macro.underscore(mod_name) <> ".ex"
+            path = Path.join(output_dir, filename)
+            File.write!(path, source)
+            path
+          end)
+
+        {:ok, written}
+    end
+  end
+
+  defp apply_namespace(source, mod_name, all_mod_names, namespace) do
+    # Namespace cross-module type references (ModName. -> Namespace.ModName.)
+    source =
+      Enum.reduce(all_mod_names, source, fn name, src ->
+        String.replace(src, "#{name}.", "#{namespace}.#{name}.")
+      end)
+
+    # Namespace the top-level defmodule declaration
+    String.replace(
+      source,
+      "defmodule #{mod_name} do",
+      "defmodule #{namespace}.#{mod_name} do",
+      global: false
+    )
+  end
+
+  defp compile_modules(ksy_path) do
+    spec = Parser.parse_file(ksy_path)
+    formats_dir = Path.dirname(ksy_path)
+
+    imported_enums = collect_imported_enums(spec.imports, formats_dir, formats_dir)
+    merged_spec = %{spec | enums: Map.merge(imported_enums, spec.enums)}
+
+    import_module_pairs =
+      compile_import_modules(spec.imports, formats_dir, formats_dir, [], MapSet.new(), merged_spec.enums)
+
+    main_source = ElixirCompiler.compile(merged_spec)
+    main_mod_name = Ksc.Compiler.Utils.to_module_name(spec.id)
+
+    import_module_pairs ++ [{main_mod_name, main_source}]
+  end
+
+  defp compile_import_modules([], _dir, _root_dir, acc, _seen, _parent_enums), do: Enum.reverse(acc)
+  defp compile_import_modules([imp | rest], dir, root_dir, acc, seen, parent_enums) do
+    {imp_name, resolve_dir} = resolve_import_dir(imp, dir, root_dir)
+
+    if MapSet.member?(seen, imp_name) do
+      compile_import_modules(rest, dir, root_dir, acc, seen, parent_enums)
+    else
+      seen = MapSet.put(seen, imp_name)
+      ksy_path = find_import(imp_name, resolve_dir)
+
+      if ksy_path && File.exists?(ksy_path) do
+        spec = Parser.parse_file(ksy_path)
+        merged_enums = Map.merge(parent_enums, spec.enums)
+        spec = %{spec | enums: merged_enums}
+        sub_dir = Path.dirname(ksy_path)
+        sub_pairs = compile_import_modules(spec.imports, sub_dir, root_dir, [], seen, merged_enums)
+        source = ElixirCompiler.compile(spec)
+        mod_name = Ksc.Compiler.Utils.to_module_name(spec.id)
+        compile_import_modules(rest, dir, root_dir, [{mod_name, source} | sub_pairs] ++ acc, seen, parent_enums)
+      else
+        compile_import_modules(rest, dir, root_dir, acc, seen, parent_enums)
+      end
+    end
+  end
+
   @doc """
   Compile a .ksy file and load the resulting module into the VM.
   Returns {:ok, module_atom} on success.

@@ -33,7 +33,7 @@ defmodule Ksc.Expression do
 
       # Comparison
       has_binary_op?(expr, [" == ", " != ", " <= ", " >= ", " < ", " > "]) ->
-        translate_comparison(expr, mode)
+        translate_binary_op(expr, [" == ", " != ", " <= ", " >= ", " < ", " > "], mode)
 
       # Bitwise
       has_binary_op?(expr, [" | ", " & ", " ^ "]) ->
@@ -254,15 +254,6 @@ defmodule Ksc.Expression do
     "(#{do_translate(left, mode)} #{elixir_op} #{do_translate(right, mode)})"
   end
 
-  defp translate_comparison(expr, mode) do
-    ops = [" == ", " != ", " <= ", " >= ", " < ", " > "]
-    {op, pos} = find_rightmost_op(expr, ops)
-    left = String.slice(expr, 0, pos) |> String.trim()
-    right = String.slice(expr, (pos + String.length(op))..-1//1) |> String.trim()
-    elixir_op = String.trim(op)
-    "(#{do_translate(left, mode)} #{elixir_op} #{do_translate(right, mode)})"
-  end
-
   defp translate_bitwise(expr, mode) do
     ops = [" | ", " & ", " ^ "]
     {op, pos} = find_rightmost_op(expr, ops)
@@ -293,7 +284,7 @@ defmodule Ksc.Expression do
   end
 
   defp translate_additive(expr, mode) do
-    {op, pos} = find_rightmost_additive_op(expr)
+    {op, pos} = find_rightmost_op(expr, [" + ", " - "])
     left = String.slice(expr, 0, pos) |> String.trim()
     right = String.slice(expr, (pos + String.length(op))..-1//1) |> String.trim()
 
@@ -596,15 +587,6 @@ defmodule Ksc.Expression do
   defp find_rightmost_op(expr, ops) do
     results =
       Enum.flat_map(ops, fn op ->
-        find_all_positions(expr, op) |> Enum.map(&{op, &1})
-      end)
-
-    if results == [], do: {nil, nil}, else: Enum.max_by(results, &elem(&1, 1))
-  end
-
-  defp find_rightmost_additive_op(expr) do
-    results =
-      Enum.flat_map([" + ", " - "], fn op ->
         find_all_positions(expr, op) |> Enum.map(&{op, &1})
       end)
 

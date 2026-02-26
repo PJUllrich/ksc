@@ -127,19 +127,10 @@ defmodule Ksc.Stream do
 
   @doc "Terminate at terminator, then strip pad bytes only when terminator was NOT found."
   def terminate_and_pad(data, term_byte, include, pad_byte) do
-    bytes = :binary.bin_to_list(data)
-
-    case Enum.find_index(bytes, &(&1 == term_byte)) do
-      nil ->
-        # No terminator found - strip pad bytes from the right
-        strip_pad_right(data, pad_byte)
-
-      idx ->
-        if include do
-          :binary.list_to_bin(Enum.take(bytes, idx + 1))
-        else
-          :binary.list_to_bin(Enum.take(bytes, idx))
-        end
+    if :binary.match(data, <<term_byte>>) == :nomatch do
+      strip_pad_right(data, pad_byte)
+    else
+      terminate_at(data, term_byte, include)
     end
   end
 
@@ -328,11 +319,15 @@ defmodule Ksc.Stream do
   def kaitai_first(nil), do: nil
   def kaitai_first(bin) when is_binary(bin), do: :binary.at(bin, 0)
   def kaitai_first(list) when is_list(list), do: List.first(list)
+  def kaitai_first(%{first: val}), do: val
+  def kaitai_first(%{} = map), do: map
 
   @doc "Get last element of a list or last byte of a binary."
   def kaitai_last(nil), do: nil
   def kaitai_last(bin) when is_binary(bin), do: :binary.at(bin, byte_size(bin) - 1)
   def kaitai_last(list) when is_list(list), do: List.last(list)
+  def kaitai_last(%{last: val}), do: val
+  def kaitai_last(%{} = map), do: map
 
   @doc "Convert value to integer (like Ruby's .to_i)."
   def to_i(true), do: 1
@@ -579,12 +574,7 @@ defmodule Ksc.Stream do
 
   @doc "Zlib decompress."
   def process_zlib(data) when is_binary(data) do
-    z = :zlib.open()
-    :zlib.inflateInit(z)
-    result = :zlib.inflate(z, data)
-    :zlib.inflateEnd(z)
-    :zlib.close(z)
-    IO.iodata_to_binary(result)
+    :zlib.uncompress(data)
   end
 
 end

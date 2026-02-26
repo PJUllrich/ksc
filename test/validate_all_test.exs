@@ -151,6 +151,10 @@ defmodule ValidateAllTest do
     # Handle array indexing and dot paths
     parts = parse_path(path)
     Enum.reduce(parts, result, fn
+      {:field, "_io"}, acc when is_map(acc) ->
+        # Virtual _io object: expose _io_size/_io_data as size/data properties
+        %{size: Map.get(acc, :_io_size, 0), data: Map.get(acc, :_io_data, <<>>)}
+
       {:field, name}, acc when is_map(acc) ->
         key = String.to_atom(name)
         Map.fetch!(acc, key)
