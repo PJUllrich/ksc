@@ -18,7 +18,9 @@ defmodule Ksc do
     module_pairs =
       ksy_path
       |> compile_modules()
+      |> Enum.reverse()
       |> Enum.uniq_by(fn {name, _} -> name end)
+      |> Enum.reverse()
 
     namespace = opts[:namespace]
 

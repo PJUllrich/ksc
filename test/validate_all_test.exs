@@ -118,8 +118,7 @@ defmodule ValidateAllTest do
           mod_name = type |> Macro.camelize()
           unless Code.ensure_loaded?(String.to_atom("Elixir.#{mod_name}")) do
             try do
-              dep_ns = "VTDep#{:erlang.unique_integer([:positive])}"
-              Ksc.compile_and_load(dep_ksy, namespace: dep_ns)
+              Ksc.compile_and_load(dep_ksy)
             rescue
               _ -> :ok
             end
