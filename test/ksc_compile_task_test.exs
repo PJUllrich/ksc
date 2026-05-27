@@ -12,7 +12,8 @@ defmodule KscCompileTaskTest do
       output_dir = tmp_dir("single")
 
       try do
-        {:ok, files} = Ksc.compile_to_files(Path.join(@formats_dir, "hello_world.ksy"), output_dir)
+        {:ok, files} =
+          Ksc.compile_to_files(Path.join(@formats_dir, "hello_world.ksy"), output_dir)
 
         assert length(files) == 1
         [file] = files
@@ -152,7 +153,8 @@ defmodule KscCompileTaskTest do
       try do
         Mix.Tasks.Ksc.Compile.run([
           Path.join(@formats_dir, "hello_world.ksy"),
-          "--output", output_dir
+          "--output",
+          output_dir
         ])
 
         content = File.read!(Path.join(output_dir, "hello_world.ex"))
@@ -168,8 +170,10 @@ defmodule KscCompileTaskTest do
       try do
         Mix.Tasks.Ksc.Compile.run([
           Path.join(@formats_dir, "hello_world.ksy"),
-          "--output", output_dir,
-          "--namespace", "MyApp.Parsers"
+          "--output",
+          output_dir,
+          "--namespace",
+          "MyApp.Parsers"
         ])
 
         content = File.read!(Path.join(output_dir, "hello_world.ex"))

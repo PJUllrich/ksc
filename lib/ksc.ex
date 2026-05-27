@@ -45,14 +45,24 @@ defmodule Ksc do
   defp collect_imported_enums(imports, dir, root_dir, seen) do
     Enum.reduce(imports, %{}, fn imp, acc ->
       {imp_name, resolve_dir} = resolve_import_dir(imp, dir, root_dir)
+
       if MapSet.member?(seen, imp_name) do
         acc
       else
         seen = MapSet.put(seen, imp_name)
         ksy_path = find_import(imp_name, resolve_dir)
+
         if ksy_path && File.exists?(ksy_path) do
           imported_spec = Parser.parse_file(ksy_path)
-          sub_enums = collect_imported_enums(imported_spec.imports || [], Path.dirname(ksy_path), root_dir, seen)
+
+          sub_enums =
+            collect_imported_enums(
+              imported_spec.imports || [],
+              Path.dirname(ksy_path),
+              root_dir,
+              seen
+            )
+
           acc |> Map.merge(sub_enums) |> Map.merge(imported_spec.enums)
         else
           acc
@@ -72,6 +82,7 @@ defmodule Ksc do
 
   defp find_import(name, dir) do
     direct = Path.join(dir, "#{name}.ksy")
+
     if File.exists?(direct) do
       direct
     else
@@ -161,7 +172,14 @@ defmodule Ksc do
     merged_spec = %{spec | enums: Map.merge(imported_enums, spec.enums)}
 
     import_module_pairs =
-      compile_import_modules(spec.imports, formats_dir, formats_dir, [], MapSet.new(), merged_spec.enums)
+      compile_import_modules(
+        spec.imports,
+        formats_dir,
+        formats_dir,
+        [],
+        MapSet.new(),
+        merged_spec.enums
+      )
 
     main_source = ElixirCompiler.compile(merged_spec)
     main_mod_name = Ksc.Compiler.Utils.to_module_name(spec.id)
@@ -169,7 +187,9 @@ defmodule Ksc do
     import_module_pairs ++ [{main_mod_name, main_source}]
   end
 
-  defp compile_import_modules([], _dir, _root_dir, acc, _seen, _parent_enums), do: Enum.reverse(acc)
+  defp compile_import_modules([], _dir, _root_dir, acc, _seen, _parent_enums),
+    do: Enum.reverse(acc)
+
   defp compile_import_modules([imp | rest], dir, root_dir, acc, seen, parent_enums) do
     {imp_name, resolve_dir} = resolve_import_dir(imp, dir, root_dir)
 
@@ -184,10 +204,21 @@ defmodule Ksc do
         merged_enums = Map.merge(parent_enums, spec.enums)
         spec = %{spec | enums: merged_enums}
         sub_dir = Path.dirname(ksy_path)
-        sub_pairs = compile_import_modules(spec.imports, sub_dir, root_dir, [], seen, merged_enums)
+
+        sub_pairs =
+          compile_import_modules(spec.imports, sub_dir, root_dir, [], seen, merged_enums)
+
         source = ElixirCompiler.compile(spec)
         mod_name = Ksc.Compiler.Utils.to_module_name(spec.id)
-        compile_import_modules(rest, dir, root_dir, [{mod_name, source} | sub_pairs] ++ acc, seen, parent_enums)
+
+        compile_import_modules(
+          rest,
+          dir,
+          root_dir,
+          [{mod_name, source} | sub_pairs] ++ acc,
+          seen,
+          parent_enums
+        )
       else
         compile_import_modules(rest, dir, root_dir, acc, seen, parent_enums)
       end

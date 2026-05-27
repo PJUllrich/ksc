@@ -8,6 +8,7 @@ defmodule Ksc.Compiler.Utils do
     |> Enum.map(&String.capitalize/1)
     |> Enum.join()
   end
+
   def to_module_name(_), do: "Unknown"
 
   @doc "Ensure a field name is a valid Elixir atom-safe identifier."

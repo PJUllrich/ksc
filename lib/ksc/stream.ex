@@ -66,7 +66,10 @@ defmodule Ksc.Stream do
   defp repeat_until_check_acc(data, parse_fn, acc) do
     {item, rest, done} = parse_fn.(data)
     new_acc = [item | acc]
-    if done, do: {Enum.reverse(new_acc), rest}, else: repeat_until_check_acc(rest, parse_fn, new_acc)
+
+    if done,
+      do: {Enum.reverse(new_acc), rest},
+      else: repeat_until_check_acc(rest, parse_fn, new_acc)
   end
 
   @doc "Parse items until parse fn signals done, with index tracking."
@@ -77,7 +80,10 @@ defmodule Ksc.Stream do
   defp repeat_until_check_idx_acc(data, parse_fn, acc, idx) do
     {item, rest, done} = parse_fn.(data, idx)
     new_acc = [item | acc]
-    if done, do: {Enum.reverse(new_acc), rest}, else: repeat_until_check_idx_acc(rest, parse_fn, new_acc, idx + 1)
+
+    if done,
+      do: {Enum.reverse(new_acc), rest},
+      else: repeat_until_check_idx_acc(rest, parse_fn, new_acc, idx + 1)
   end
 
   @doc "Parse bit items repeatedly until binary is exhausted."
@@ -87,9 +93,11 @@ defmodule Ksc.Stream do
   end
 
   defp repeat_eos_bits_acc({_, 0, <<>>}, _num_bits, _bit_fn, acc), do: {Enum.reverse(acc), <<>>}
+
   defp repeat_eos_bits_acc({_bits_acc, bits_left, data} = state, num_bits, bit_fn, acc) do
     # Check if we have enough bits left to read
     total_bits = bits_left + byte_size(data) * 8
+
     if total_bits < num_bits do
       {Enum.reverse(acc), align_to_byte(state)}
     else
@@ -104,6 +112,7 @@ defmodule Ksc.Stream do
   end
 
   defp do_strip_pad_right(_data, 0, _pad_byte), do: <<>>
+
   defp do_strip_pad_right(data, pos, pad_byte) do
     if :binary.at(data, pos - 1) == pad_byte do
       do_strip_pad_right(data, pos - 1, pad_byte)
@@ -154,11 +163,14 @@ defmodule Ksc.Stream do
     case :binary.match(data, <<0>>) do
       {pos, 1} ->
         str = binary_part(data, 0, pos)
-        rest = if consume do
-          binary_part(data, pos + 1, byte_size(data) - pos - 1)
-        else
-          binary_part(data, pos, byte_size(data) - pos)
-        end
+
+        rest =
+          if consume do
+            binary_part(data, pos + 1, byte_size(data) - pos - 1)
+          else
+            binary_part(data, pos, byte_size(data) - pos)
+          end
+
         {str, rest}
 
       :nomatch ->
@@ -207,10 +219,10 @@ defmodule Ksc.Stream do
     {bits_acc, bits_left, data} = ensure_bits(bits_acc, bits_left, data, num_bits)
     # Extract top num_bits from bits_acc
     shift = bits_left - num_bits
-    value = bsr(bits_acc, shift) |> band((bsl(1, num_bits)) - 1)
+    value = bsr(bits_acc, shift) |> band(bsl(1, num_bits) - 1)
     # Remove those bits from accumulator
     remaining_bits = bits_left - num_bits
-    remaining_acc = band(bits_acc, (bsl(1, remaining_bits)) - 1)
+    remaining_acc = band(bits_acc, bsl(1, remaining_bits) - 1)
     {value, {remaining_acc, remaining_bits, data}}
   end
 
@@ -224,7 +236,7 @@ defmodule Ksc.Stream do
   def read_bits_le({bits_acc, bits_left, data}, num_bits) do
     {bits_acc, bits_left, data} = ensure_bits_le(bits_acc, bits_left, data, num_bits)
     # Extract bottom num_bits from bits_acc
-    value = band(bits_acc, (bsl(1, num_bits)) - 1)
+    value = band(bits_acc, bsl(1, num_bits) - 1)
     remaining_acc = bsr(bits_acc, num_bits)
     remaining_bits = bits_left - num_bits
     {value, {remaining_acc, remaining_bits, data}}
@@ -259,22 +271,26 @@ defmodule Ksc.Stream do
     end
   end
 
-  defp accum_bits_le(<<b, rest::binary>>, acc, shift), do: accum_bits_le(rest, bor(acc, bsl(b, shift)), shift + 8)
+  defp accum_bits_le(<<b, rest::binary>>, acc, shift),
+    do: accum_bits_le(rest, bor(acc, bsl(b, shift)), shift + 8)
+
   defp accum_bits_le(<<>>, acc, _shift), do: acc
 
   @doc "Floor division (Python-style: result rounds towards negative infinity)."
   def floor_div(a, b) when is_integer(a) and is_integer(b) do
     d = div(a, b)
     r = rem(a, b)
-    if r != 0 and (bxor(r, b) < 0), do: d - 1, else: d
+    if r != 0 and bxor(r, b) < 0, do: d - 1, else: d
   end
+
   def floor_div(a, b), do: floor_div(trunc(a), trunc(b))
 
   @doc "Floor modulo (Python-style: result has same sign as divisor)."
   def floor_mod(a, b) when is_integer(a) and is_integer(b) do
     r = rem(a, b)
-    if r != 0 and (bxor(r, b) < 0), do: r + b, else: r
+    if r != 0 and bxor(r, b) < 0, do: r + b, else: r
   end
+
   def floor_mod(a, b), do: floor_mod(trunc(a), trunc(b))
 
   @doc "Length of a string (character count) or size of a list/binary."
@@ -336,12 +352,14 @@ defmodule Ksc.Stream do
   def to_i(false), do: 0
   def to_i(x) when is_integer(x), do: x
   def to_i(x) when is_float(x), do: trunc(x)
+
   def to_i(x) when is_binary(x) do
     case Integer.parse(x) do
       {val, _} -> val
       :error -> 0
     end
   end
+
   def to_i(x) when is_atom(x), do: 0
 
   @doc "Convert value to integer with enum reverse lookup."
@@ -367,6 +385,7 @@ defmodule Ksc.Stream do
   defp do_xor_key(<<b, rest::binary>>, key, kl, i, acc) do
     do_xor_key(rest, key, kl, i + 1, [bxor(b, :binary.at(key, rem(i, kl))) | acc])
   end
+
   defp do_xor_key(<<>>, _, _, _, acc), do: acc |> :lists.reverse() |> IO.iodata_to_binary()
 
   @doc "Rotate each byte left by amount bits."
@@ -377,18 +396,31 @@ defmodule Ksc.Stream do
 
   @doc "Decode a binary from the given encoding to a UTF-8 string."
   def decode_string(data, nil), do: data
+
   def decode_string(data, encoding) do
     enc = String.upcase(to_string(encoding))
+
     case enc do
-      "UTF-8" -> data
-      "ASCII" -> data
+      "UTF-8" ->
+        data
+
+      "ASCII" ->
+        data
+
       "UTF-16LE" ->
         :unicode.characters_to_binary(data, {:utf16, :little}, :utf8)
+
       "UTF-16BE" ->
         :unicode.characters_to_binary(data, {:utf16, :big}, :utf8)
-      "SJIS" -> decode_sjis(data)
-      "IBM437" -> decode_ibm437(data)
-      _ -> data
+
+      "SJIS" ->
+        decode_sjis(data)
+
+      "IBM437" ->
+        decode_ibm437(data)
+
+      _ ->
+        data
     end
   end
 
@@ -402,17 +434,22 @@ defmodule Ksc.Stream do
     else
       case :binary.match(data, <<0>>) do
         {pos, 1} ->
-          str = if include do
-            binary_part(data, 0, pos + 1)
-          else
-            binary_part(data, 0, pos)
-          end
-          rest = if consume do
-            binary_part(data, pos + 1, byte_size(data) - pos - 1)
-          else
-            binary_part(data, pos, byte_size(data) - pos)
-          end
+          str =
+            if include do
+              binary_part(data, 0, pos + 1)
+            else
+              binary_part(data, 0, pos)
+            end
+
+          rest =
+            if consume do
+              binary_part(data, pos + 1, byte_size(data) - pos - 1)
+            else
+              binary_part(data, pos, byte_size(data) - pos)
+            end
+
           {decode_string(str, encoding), rest}
+
         :nomatch ->
           {decode_string(data, encoding), <<>>}
       end
@@ -425,16 +462,20 @@ defmodule Ksc.Stream do
 
   defp find_utf16_terminator(data, pos, consume, include) when pos + 1 < byte_size(data) do
     if :binary.at(data, pos) == 0 and :binary.at(data, pos + 1) == 0 do
-      str = if include do
-        binary_part(data, 0, pos + 2)
-      else
-        binary_part(data, 0, pos)
-      end
-      rest = if consume do
-        binary_part(data, pos + 2, byte_size(data) - pos - 2)
-      else
-        binary_part(data, pos, byte_size(data) - pos)
-      end
+      str =
+        if include do
+          binary_part(data, 0, pos + 2)
+        else
+          binary_part(data, 0, pos)
+        end
+
+      rest =
+        if consume do
+          binary_part(data, pos + 2, byte_size(data) - pos - 2)
+        else
+          binary_part(data, pos, byte_size(data) - pos)
+        end
+
       {str, rest}
     else
       find_utf16_terminator(data, pos + 2, consume, include)
@@ -450,19 +491,23 @@ defmodule Ksc.Stream do
   end
 
   defp decode_sjis_chars(<<>>, acc), do: IO.iodata_to_binary(Enum.reverse(acc))
+
   defp decode_sjis_chars(<<b, rest::binary>>, acc) when b < 0x80 do
     decode_sjis_chars(rest, [<<b>> | acc])
   end
+
   defp decode_sjis_chars(<<b, rest::binary>>, acc) when b >= 0xA1 and b <= 0xDF do
     # Half-width katakana
     unicode = 0xFF61 + (b - 0xA1)
     decode_sjis_chars(rest, [<<unicode::utf8>> | acc])
   end
+
   defp decode_sjis_chars(<<b1, b2, rest::binary>>, acc)
        when (b1 >= 0x81 and b1 <= 0x9F) or (b1 >= 0xE0 and b1 <= 0xEF) do
     unicode = sjis_to_unicode(b1, b2)
     decode_sjis_chars(rest, [<<unicode::utf8>> | acc])
   end
+
   defp decode_sjis_chars(<<_b, rest::binary>>, acc) do
     decode_sjis_chars(rest, [<<0xEF, 0xBF, 0xBD>> | acc])
   end
@@ -477,22 +522,27 @@ defmodule Ksc.Stream do
     row_offset = if b1 < 0xA0, do: 0x70, else: 0xB0
     row = (b1 - row_offset) * 2 - 1
 
-    {row, col} = if b2 >= 0x9F do
-      {row + 1, b2 - 0x7E}
-    else
-      col = if b2 > 0x7F, do: b2 - 0x40, else: b2 - 0x3F
-      {row, col + 0x20}
-    end
+    {row, col} =
+      if b2 >= 0x9F do
+        {row + 1, b2 - 0x7E}
+      else
+        col = if b2 > 0x7F, do: b2 - 0x40, else: b2 - 0x3F
+        {row, col + 0x20}
+      end
 
     {row, col}
   end
 
   defp jis_to_unicode(row, col) do
     cond do
-      row == 0x24 -> 0x3020 + col  # Hiragana
-      row == 0x25 -> 0x3080 + col  # Katakana
-      row == 0x21 -> jis_symbols_row1(col) # Symbols row 1
-      row == 0x23 -> jis_fullwidth_ascii(col) # Full-width ASCII
+      # Hiragana
+      row == 0x24 -> 0x3020 + col
+      # Katakana
+      row == 0x25 -> 0x3080 + col
+      # Symbols row 1
+      row == 0x21 -> jis_symbols_row1(col)
+      # Full-width ASCII
+      row == 0x23 -> jis_fullwidth_ascii(col)
       true -> 0xFFFD
     end
   end
@@ -500,18 +550,31 @@ defmodule Ksc.Stream do
   defp jis_symbols_row1(col) do
     # Common JIS X 0208 row 1 symbols
     table = %{
-      0x21 => 0x3000, 0x22 => 0x3001, 0x23 => 0x3002, 0x24 => 0xFF0C,
-      0x25 => 0xFF0E, 0x26 => 0x30FB, 0x27 => 0xFF1A, 0x28 => 0xFF1B,
-      0x29 => 0xFF1F, 0x2A => 0xFF01, 0x3C => 0xFF0D, 0x5C => 0x30FC
+      0x21 => 0x3000,
+      0x22 => 0x3001,
+      0x23 => 0x3002,
+      0x24 => 0xFF0C,
+      0x25 => 0xFF0E,
+      0x26 => 0x30FB,
+      0x27 => 0xFF1A,
+      0x28 => 0xFF1B,
+      0x29 => 0xFF1F,
+      0x2A => 0xFF01,
+      0x3C => 0xFF0D,
+      0x5C => 0x30FC
     }
+
     Map.get(table, col, 0xFFFD)
   end
 
   defp jis_fullwidth_ascii(col) do
     cond do
-      col >= 0x30 and col <= 0x39 -> 0xFF10 + (col - 0x30)  # 0-9
-      col >= 0x41 and col <= 0x5A -> 0xFF21 + (col - 0x41)  # A-Z
-      col >= 0x61 and col <= 0x7A -> 0xFF41 + (col - 0x61)  # a-z
+      # 0-9
+      col >= 0x30 and col <= 0x39 -> 0xFF10 + (col - 0x30)
+      # A-Z
+      col >= 0x41 and col <= 0x5A -> 0xFF21 + (col - 0x41)
+      # a-z
+      col >= 0x61 and col <= 0x7A -> 0xFF41 + (col - 0x61)
       true -> 0xFFFD
     end
   end
@@ -530,33 +593,136 @@ defmodule Ksc.Stream do
   # IBM437 high byte to Unicode mapping
   defp ibm437_to_unicode(b) do
     table = %{
-      128 => 0x00C7, 129 => 0x00FC, 130 => 0x00E9, 131 => 0x00E2, 132 => 0x00E4,
-      133 => 0x00E0, 134 => 0x00E5, 135 => 0x00E7, 136 => 0x00EA, 137 => 0x00EB,
-      138 => 0x00E8, 139 => 0x00EF, 140 => 0x00EE, 141 => 0x00EC, 142 => 0x00C4,
-      143 => 0x00C5, 144 => 0x00C9, 145 => 0x00E6, 146 => 0x00C6, 147 => 0x00F4,
-      148 => 0x00F6, 149 => 0x00F2, 150 => 0x00FB, 151 => 0x00F9, 152 => 0x00FF,
-      153 => 0x00D6, 154 => 0x00DC, 155 => 0x00A2, 156 => 0x00A3, 157 => 0x00A5,
-      158 => 0x20A7, 159 => 0x0192, 160 => 0x00E1, 161 => 0x00ED, 162 => 0x00F3,
-      163 => 0x00FA, 164 => 0x00F1, 165 => 0x00D1, 166 => 0x00AA, 167 => 0x00BA,
-      168 => 0x00BF, 169 => 0x2310, 170 => 0x00AC, 171 => 0x00BD, 172 => 0x00BC,
-      173 => 0x00A1, 174 => 0x00AB, 175 => 0x00BB, 176 => 0x2591, 177 => 0x2592,
-      178 => 0x2593, 179 => 0x2502, 180 => 0x2524, 181 => 0x2561, 182 => 0x2562,
-      183 => 0x2556, 184 => 0x2555, 185 => 0x2563, 186 => 0x2551, 187 => 0x2557,
-      188 => 0x255D, 189 => 0x255C, 190 => 0x255B, 191 => 0x2510, 192 => 0x2514,
-      193 => 0x2534, 194 => 0x252C, 195 => 0x251C, 196 => 0x2500, 197 => 0x253C,
-      198 => 0x255E, 199 => 0x255F, 200 => 0x255A, 201 => 0x2554, 202 => 0x2569,
-      203 => 0x2566, 204 => 0x2560, 205 => 0x2550, 206 => 0x256C, 207 => 0x2567,
-      208 => 0x2568, 209 => 0x2564, 210 => 0x2565, 211 => 0x2559, 212 => 0x2558,
-      213 => 0x2552, 214 => 0x2553, 215 => 0x256B, 216 => 0x256A, 217 => 0x2518,
-      218 => 0x250C, 219 => 0x2588, 220 => 0x2584, 221 => 0x258C, 222 => 0x2590,
-      223 => 0x2580, 224 => 0x03B1, 225 => 0x00DF, 226 => 0x0393, 227 => 0x03C0,
-      228 => 0x03A3, 229 => 0x03C3, 230 => 0x00B5, 231 => 0x03C4, 232 => 0x03A6,
-      233 => 0x0398, 234 => 0x03A9, 235 => 0x03B4, 236 => 0x221E, 237 => 0x03C6,
-      238 => 0x03B5, 239 => 0x2229, 240 => 0x2261, 241 => 0x00B1, 242 => 0x2265,
-      243 => 0x2264, 244 => 0x2320, 245 => 0x2321, 246 => 0x00F7, 247 => 0x2248,
-      248 => 0x00B0, 249 => 0x2219, 250 => 0x00B7, 251 => 0x221A, 252 => 0x207F,
-      253 => 0x00B2, 254 => 0x25A0, 255 => 0x00A0
+      128 => 0x00C7,
+      129 => 0x00FC,
+      130 => 0x00E9,
+      131 => 0x00E2,
+      132 => 0x00E4,
+      133 => 0x00E0,
+      134 => 0x00E5,
+      135 => 0x00E7,
+      136 => 0x00EA,
+      137 => 0x00EB,
+      138 => 0x00E8,
+      139 => 0x00EF,
+      140 => 0x00EE,
+      141 => 0x00EC,
+      142 => 0x00C4,
+      143 => 0x00C5,
+      144 => 0x00C9,
+      145 => 0x00E6,
+      146 => 0x00C6,
+      147 => 0x00F4,
+      148 => 0x00F6,
+      149 => 0x00F2,
+      150 => 0x00FB,
+      151 => 0x00F9,
+      152 => 0x00FF,
+      153 => 0x00D6,
+      154 => 0x00DC,
+      155 => 0x00A2,
+      156 => 0x00A3,
+      157 => 0x00A5,
+      158 => 0x20A7,
+      159 => 0x0192,
+      160 => 0x00E1,
+      161 => 0x00ED,
+      162 => 0x00F3,
+      163 => 0x00FA,
+      164 => 0x00F1,
+      165 => 0x00D1,
+      166 => 0x00AA,
+      167 => 0x00BA,
+      168 => 0x00BF,
+      169 => 0x2310,
+      170 => 0x00AC,
+      171 => 0x00BD,
+      172 => 0x00BC,
+      173 => 0x00A1,
+      174 => 0x00AB,
+      175 => 0x00BB,
+      176 => 0x2591,
+      177 => 0x2592,
+      178 => 0x2593,
+      179 => 0x2502,
+      180 => 0x2524,
+      181 => 0x2561,
+      182 => 0x2562,
+      183 => 0x2556,
+      184 => 0x2555,
+      185 => 0x2563,
+      186 => 0x2551,
+      187 => 0x2557,
+      188 => 0x255D,
+      189 => 0x255C,
+      190 => 0x255B,
+      191 => 0x2510,
+      192 => 0x2514,
+      193 => 0x2534,
+      194 => 0x252C,
+      195 => 0x251C,
+      196 => 0x2500,
+      197 => 0x253C,
+      198 => 0x255E,
+      199 => 0x255F,
+      200 => 0x255A,
+      201 => 0x2554,
+      202 => 0x2569,
+      203 => 0x2566,
+      204 => 0x2560,
+      205 => 0x2550,
+      206 => 0x256C,
+      207 => 0x2567,
+      208 => 0x2568,
+      209 => 0x2564,
+      210 => 0x2565,
+      211 => 0x2559,
+      212 => 0x2558,
+      213 => 0x2552,
+      214 => 0x2553,
+      215 => 0x256B,
+      216 => 0x256A,
+      217 => 0x2518,
+      218 => 0x250C,
+      219 => 0x2588,
+      220 => 0x2584,
+      221 => 0x258C,
+      222 => 0x2590,
+      223 => 0x2580,
+      224 => 0x03B1,
+      225 => 0x00DF,
+      226 => 0x0393,
+      227 => 0x03C0,
+      228 => 0x03A3,
+      229 => 0x03C3,
+      230 => 0x00B5,
+      231 => 0x03C4,
+      232 => 0x03A6,
+      233 => 0x0398,
+      234 => 0x03A9,
+      235 => 0x03B4,
+      236 => 0x221E,
+      237 => 0x03C6,
+      238 => 0x03B5,
+      239 => 0x2229,
+      240 => 0x2261,
+      241 => 0x00B1,
+      242 => 0x2265,
+      243 => 0x2264,
+      244 => 0x2320,
+      245 => 0x2321,
+      246 => 0x00F7,
+      247 => 0x2248,
+      248 => 0x00B0,
+      249 => 0x2219,
+      250 => 0x00B7,
+      251 => 0x221A,
+      252 => 0x207F,
+      253 => 0x00B2,
+      254 => 0x25A0,
+      255 => 0x00A0
     }
+
     Map.get(table, b, 0xFFFD)
   end
 
@@ -571,5 +737,4 @@ defmodule Ksc.Stream do
   def process_zlib(data) when is_binary(data) do
     :zlib.uncompress(data)
   end
-
 end

@@ -33,12 +33,17 @@ defmodule Ksc.Parser do
 
   defp parse_endian("le"), do: :le
   defp parse_endian("be"), do: :be
+
   defp parse_endian(%{"switch-on" => switch_on, "cases" => cases}) do
-    parsed_cases = Enum.map(cases || %{}, fn {k, v} ->
-      {to_string(k), parse_endian(v)}
-    end) |> Map.new()
+    parsed_cases =
+      Enum.map(cases || %{}, fn {k, v} ->
+        {to_string(k), parse_endian(v)}
+      end)
+      |> Map.new()
+
     {:switch, to_string(switch_on), parsed_cases}
   end
+
   defp parse_endian(_), do: nil
 
   defp parse_seq(nil), do: []
@@ -76,9 +81,12 @@ defmodule Ksc.Parser do
     # switch-on type
     %{
       "switch-on" => stringify_expr(Map.get(map, "switch-on")),
-      "cases" => Map.get(map, "cases", %{}) |> Enum.map(fn {k, v} ->
-        {stringify_expr(k), parse_type_ref(v)}
-      end) |> Map.new()
+      "cases" =>
+        Map.get(map, "cases", %{})
+        |> Enum.map(fn {k, v} ->
+          {stringify_expr(k), parse_type_ref(v)}
+        end)
+        |> Map.new()
     }
   end
 
@@ -111,6 +119,7 @@ defmodule Ksc.Parser do
       String.starts_with?(str, "0x") ->
         {val, _} = Integer.parse(String.trim_leading(str, "0x"), 16)
         val
+
       true ->
         String.to_integer(str)
     end
@@ -163,6 +172,7 @@ defmodule Ksc.Parser do
   end
 
   defp parse_params(nil), do: []
+
   defp parse_params(list) when is_list(list) do
     Enum.map(list, fn param ->
       %{
@@ -180,12 +190,15 @@ defmodule Ksc.Parser do
       values =
         Enum.map(values_map, fn {k, v} ->
           key = if is_integer(k), do: k, else: parse_enum_key(to_string(k))
-          val = case v do
-            v when is_binary(v) -> String.to_atom(v)
-            v when is_map(v) -> String.to_atom(Map.get(v, "id", to_string(k)))
-            v when is_atom(v) -> v
-            _ -> v
-          end
+
+          val =
+            case v do
+              v when is_binary(v) -> String.to_atom(v)
+              v when is_map(v) -> String.to_atom(Map.get(v, "id", to_string(k)))
+              v when is_atom(v) -> v
+              _ -> v
+            end
+
           {key, val}
         end)
         |> Map.new()
@@ -200,6 +213,7 @@ defmodule Ksc.Parser do
       String.starts_with?(str, "0x") ->
         {val, _} = Integer.parse(String.trim_leading(str, "0x"), 16)
         val
+
       true ->
         String.to_integer(str)
     end

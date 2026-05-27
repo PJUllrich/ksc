@@ -42,41 +42,46 @@ defmodule ValidateAllTest do
 
     # Phase 1: Compile
     ns = "VT#{:erlang.unique_integer([:positive])}"
-    {compile_result, source} = try do
-      {:ok, src} = Ksc.compile(ksy_path, namespace: ns)
-      {:ok, src}
-    rescue
-      e -> {:compile_error, Exception.message(e)}
-    end
+
+    {compile_result, source} =
+      try do
+        {:ok, src} = Ksc.compile(ksy_path, namespace: ns)
+        {:ok, src}
+      rescue
+        e -> {:compile_error, Exception.message(e)}
+      end
 
     if compile_result != :ok do
       flunk("Compile failed for #{ksy_id}: #{source}")
     end
 
     # Phase 2: Load
-    load_result = try do
-      modules = Code.compile_string(source)
-      {mod, _} = List.last(modules)
-      {:ok, mod}
-    rescue
-      e -> {:load_error, Exception.message(e)}
-    end
+    load_result =
+      try do
+        modules = Code.compile_string(source)
+        {mod, _} = List.last(modules)
+        {:ok, mod}
+      rescue
+        e -> {:load_error, Exception.message(e)}
+      end
 
     case load_result do
       {:ok, mod} ->
         if data_file do
           bin_path = Path.join(@fixtures_dir, data_file)
+
           unless File.exists?(bin_path) do
             flunk("Binary fixture not found: #{bin_path}")
           end
 
           # Phase 3: Parse
-          parse_result = try do
-            result = mod.from_file(bin_path)
-            {:ok, result}
-          rescue
-            e -> {:parse_error, Exception.message(e)}
-          end
+          parse_result =
+            try do
+              result = mod.from_file(bin_path)
+              {:ok, result}
+            rescue
+              e -> {:parse_error, Exception.message(e)}
+            end
 
           case parse_result do
             {:ok, result} ->
@@ -104,18 +109,22 @@ defmodule ValidateAllTest do
   defp ensure_opaque_types_loaded(ksy_path) do
     ksy = Ksc.Yaml.parse_file(ksy_path)
     meta = Map.get(ksy, "meta", %{}) || %{}
+
     if Map.get(meta, "ks-opaque-types") == true do
       formats_dir = Path.dirname(ksy_path)
       known_types = Map.keys(Map.get(ksy, "types", %{}))
       seq = Map.get(ksy, "seq", []) || []
+
       for attr <- seq,
           type = Map.get(attr, "type"),
           is_binary(type),
           type not in known_types,
           type not in ~w(u1 u2 u4 u8 s1 s2 s4 s8 f4 f8 str strz) do
         dep_ksy = Path.join(formats_dir, "#{type}.ksy")
+
         if File.exists?(dep_ksy) do
           mod_name = type |> Macro.camelize()
+
           unless Code.ensure_loaded?(String.to_atom("Elixir.#{mod_name}")) do
             try do
               Ksc.compile_and_load(dep_ksy)
@@ -129,11 +138,12 @@ defmodule ValidateAllTest do
   end
 
   defp check_assertion(result, %{"actual" => actual_path, "expected" => expected}, ksy_id) do
-    actual_value = try do
-      resolve_path(result, actual_path)
-    rescue
-      e -> {:resolve_error, Exception.message(e)}
-    end
+    actual_value =
+      try do
+        resolve_path(result, actual_path)
+      rescue
+        e -> {:resolve_error, Exception.message(e)}
+      end
 
     case actual_value do
       {:resolve_error, msg} ->
@@ -151,6 +161,7 @@ defmodule ValidateAllTest do
   defp resolve_path(result, path) when is_binary(path) do
     # Handle array indexing and dot paths
     parts = parse_path(path)
+
     Enum.reduce(parts, result, fn
       {:field, "_io"}, acc when is_map(acc) ->
         # Virtual _io object: expose _io_size/_io_data as size/data properties
@@ -169,6 +180,7 @@ defmodule ValidateAllTest do
       {:method, name}, acc when is_map(acc) ->
         # If it's a map, try field access first (these names might be fields)
         key = String.to_atom(name)
+
         if Map.has_key?(acc, key) do
           Map.fetch!(acc, key)
         else
@@ -212,6 +224,7 @@ defmodule ValidateAllTest do
       case Regex.run(~r/^(.+)\[(\d+)\]$/, part) do
         [_, name, idx] ->
           [{:field, name}, {:index, String.to_integer(idx)}]
+
         nil ->
           # First part is always a field; only subsequent parts can be methods
           if index > 0 and part in @method_names do
@@ -242,10 +255,12 @@ defmodule ValidateAllTest do
       String.starts_with?(val, "\"") and String.ends_with?(val, "\"") ->
         str = String.slice(val, 1..-2//1)
         # Unescape \uXXXX sequences
-        str = Regex.replace(~r/\\u([0-9a-fA-F]{4})/, str, fn _, hex ->
-          {cp, _} = Integer.parse(hex, 16)
-          <<cp::utf8>>
-        end)
+        str =
+          Regex.replace(~r/\\u([0-9a-fA-F]{4})/, str, fn _, hex ->
+            {cp, _} = Integer.parse(hex, 16)
+            <<cp::utf8>>
+          end)
+
         {:string, str}
 
       # Hex integer literal: '0xffffffff' or '0xffff_ffff'
@@ -265,7 +280,7 @@ defmodule ValidateAllTest do
         {:string_array, parse_string_array(val)}
 
       # Byte array: '[0x73, 0x74, ...]' or '[...].as<bytes>'
-      String.starts_with?(val, "[") and (String.contains?(val, "]")) ->
+      String.starts_with?(val, "[") and String.contains?(val, "]") ->
         {:bytes, parse_byte_array(val)}
 
       # Float with .as<type> suffix: "0.5.as<f4>"
@@ -275,9 +290,14 @@ defmodule ValidateAllTest do
         {:float, float_val}
 
       # Boolean strings
-      val == "true" -> {:bool, true}
-      val == "false" -> {:bool, false}
-      val == "null" -> {:null, nil}
+      val == "true" ->
+        {:bool, true}
+
+      val == "false" ->
+        {:bool, false}
+
+      val == "null" ->
+        {:null, nil}
 
       # Simple arithmetic expression: "1 + 4 + 2" -> 7
       Regex.match?(~r/^[\d\s\+\-\*\/]+$/, val) and String.contains?(val, " ") ->
@@ -289,8 +309,11 @@ defmodule ValidateAllTest do
         end
 
       # Negative zero: -0 is just 0, -0.0 is -0.0 (Elixir preserves float sign)
-      val == "-0" -> {:int, 0}
-      val == "-0.0" -> {:float, -0.0}
+      val == "-0" ->
+        {:int, 0}
+
+      val == "-0.0" ->
+        {:float, -0.0}
 
       true ->
         {:raw, val}
@@ -303,11 +326,13 @@ defmodule ValidateAllTest do
     # Strip .as<> suffix if present
     str = Regex.replace(~r/\]\.as<[^>]+>$/, str, "]")
     inner = String.slice(str, 1..-2//1) |> String.trim()
+
     if inner == "" do
       []
     else
       # Parse comma-separated quoted strings (double or single quoted)
       results = Regex.scan(~r/"([^"]*)"/, inner)
+
       if results == [] do
         # Try single-quoted strings
         Regex.scan(~r/'([^']*)'/, inner)
@@ -335,12 +360,15 @@ defmodule ValidateAllTest do
       |> String.split(",")
       |> Enum.map(fn s ->
         s = String.trim(s)
+
         cond do
           String.starts_with?(s, "0x") ->
             {val, _} = Integer.parse(String.trim_leading(s, "0x"), 16)
             val
+
           Regex.match?(~r/^-?\d+$/, s) ->
             String.to_integer(s)
+
           true ->
             # Try evaluating arithmetic expression like "0 + 1"
             try do
@@ -356,43 +384,46 @@ defmodule ValidateAllTest do
 
   defp assert_values_match(actual, {:int, expected}, path, ksy_id) do
     assert actual == expected,
-      "#{ksy_id}: #{path} expected #{expected}, got #{inspect(actual)}"
+           "#{ksy_id}: #{path} expected #{expected}, got #{inspect(actual)}"
   end
 
   defp assert_values_match(actual, {:float, expected}, path, ksy_id) do
-    assert_in_delta actual, expected, 0.0001,
-      "#{ksy_id}: #{path} expected #{expected}, got #{inspect(actual)}"
+    assert_in_delta actual,
+                    expected,
+                    0.0001,
+                    "#{ksy_id}: #{path} expected #{expected}, got #{inspect(actual)}"
   end
 
   defp assert_values_match(actual, {:bool, expected}, path, ksy_id) do
     assert actual == expected,
-      "#{ksy_id}: #{path} expected #{expected}, got #{inspect(actual)}"
+           "#{ksy_id}: #{path} expected #{expected}, got #{inspect(actual)}"
   end
 
   defp assert_values_match(actual, {:null, nil}, path, ksy_id) do
     assert actual == nil,
-      "#{ksy_id}: #{path} expected nil, got #{inspect(actual)}"
+           "#{ksy_id}: #{path} expected nil, got #{inspect(actual)}"
   end
 
   defp assert_values_match(actual, {:string, expected}, path, ksy_id) do
     assert actual == expected,
-      "#{ksy_id}: #{path} expected #{inspect(expected)}, got #{inspect(actual)}"
+           "#{ksy_id}: #{path} expected #{inspect(expected)}, got #{inspect(actual)}"
   end
 
   defp assert_values_match(actual, {:enum, expected}, path, ksy_id) do
     assert actual == expected,
-      "#{ksy_id}: #{path} expected #{inspect(expected)}, got #{inspect(actual)}"
+           "#{ksy_id}: #{path} expected #{inspect(expected)}, got #{inspect(actual)}"
   end
 
   defp assert_values_match(actual, {:string_array, expected}, path, ksy_id) do
     assert actual == expected,
-      "#{ksy_id}: #{path} expected #{inspect(expected)}, got #{inspect(actual)}"
+           "#{ksy_id}: #{path} expected #{inspect(expected)}, got #{inspect(actual)}"
   end
 
   defp assert_values_match(actual, {:bytes, expected}, path, ksy_id) do
     actual_bytes = if is_binary(actual), do: :binary.bin_to_list(actual), else: actual
+
     assert actual_bytes == expected,
-      "#{ksy_id}: #{path} expected #{inspect(expected)}, got #{inspect(actual_bytes)}"
+           "#{ksy_id}: #{path} expected #{inspect(expected)}, got #{inspect(actual_bytes)}"
   end
 
   defp assert_values_match(actual, {:raw, expected}, path, ksy_id) when is_binary(expected) do
@@ -401,30 +432,35 @@ defmodule ValidateAllTest do
       String.starts_with?(expected, "0x") ->
         hex_str = String.trim_leading(expected, "0x") |> String.replace("_", "")
         {int_val, _} = Integer.parse(hex_str, 16)
+
         assert actual == int_val,
-          "#{ksy_id}: #{path} expected #{expected} (#{int_val}), got #{inspect(actual)}"
+               "#{ksy_id}: #{path} expected #{expected} (#{int_val}), got #{inspect(actual)}"
 
       String.starts_with?(expected, "0b") ->
         bin_str = String.trim_leading(expected, "0b") |> String.replace("_", "")
         {int_val, _} = Integer.parse(bin_str, 2)
+
         assert actual == int_val,
-          "#{ksy_id}: #{path} expected #{expected} (#{int_val}), got #{inspect(actual)}"
+               "#{ksy_id}: #{path} expected #{expected} (#{int_val}), got #{inspect(actual)}"
 
       # Float with .as<type> suffix: "0.5.as<f4>"
       Regex.match?(~r/^-?[\d.]+\.as<[^>]+>$/, expected) ->
         num_str = Regex.replace(~r/\.as<[^>]+>$/, expected, "")
         {float_val, _} = Float.parse(num_str)
-        assert_in_delta actual, float_val, 0.0001,
-          "#{ksy_id}: #{path} expected #{expected}, got #{inspect(actual)}"
+
+        assert_in_delta actual,
+                        float_val,
+                        0.0001,
+                        "#{ksy_id}: #{path} expected #{expected}, got #{inspect(actual)}"
 
       true ->
         assert to_string(actual) == to_string(expected),
-          "#{ksy_id}: #{path} expected #{inspect(expected)}, got #{inspect(actual)}"
+               "#{ksy_id}: #{path} expected #{inspect(expected)}, got #{inspect(actual)}"
     end
   end
 
   defp assert_values_match(actual, {:raw, expected}, path, ksy_id) do
     assert to_string(actual) == to_string(expected),
-      "#{ksy_id}: #{path} expected #{inspect(expected)}, got #{inspect(actual)}"
+           "#{ksy_id}: #{path} expected #{inspect(expected)}, got #{inspect(actual)}"
   end
 end

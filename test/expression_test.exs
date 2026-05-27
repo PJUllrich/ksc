@@ -71,7 +71,8 @@ defmodule ExpressionTest do
     end
 
     test ".to_i becomes Ksc.Stream.to_i()" do
-      assert Expression.translate_for_instance("x.to_i") == "Ksc.Stream.to_i(result[:x], @kaitai_enum_reverse)"
+      assert Expression.translate_for_instance("x.to_i") ==
+               "Ksc.Stream.to_i(result[:x], @kaitai_enum_reverse)"
     end
 
     test ".length becomes kaitai_length()" do

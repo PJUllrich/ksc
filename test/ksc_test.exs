@@ -10,7 +10,12 @@ defmodule KscTest do
 
   test "compile_and_load/1 returns module atom" do
     ns = "KT#{:erlang.unique_integer([:positive])}"
-    {:ok, mod} = Ksc.compile_and_load("reference_code/kaitai_struct_tests/formats/hello_world.ksy", namespace: ns)
+
+    {:ok, mod} =
+      Ksc.compile_and_load("reference_code/kaitai_struct_tests/formats/hello_world.ksy",
+        namespace: ns
+      )
+
     assert is_atom(mod)
     assert function_exported?(mod, :from_file, 1)
     assert function_exported?(mod, :from_binary, 1)

@@ -99,7 +99,9 @@ defmodule Ksc.Compiler.ElixirCompiler do
     # Only include @kaitai_enum_reverse if the body actually references it
     body =
       if String.contains?(body, "@kaitai_enum_reverse") do
-        reverse_line = if enum_reverse_attr != "", do: enum_reverse_attr, else: "@kaitai_enum_reverse %{}"
+        reverse_line =
+          if enum_reverse_attr != "", do: enum_reverse_attr, else: "@kaitai_enum_reverse %{}"
+
         reverse_line <> "\n" <> body
       else
         body
@@ -1417,11 +1419,20 @@ defmodule Ksc.Compiler.ElixirCompiler do
       suppress_line = if suppress != "", do: suppress, else: nil
 
       body =
-        [io_size_init, io_pos_init, parent_init, root_init, is_le_init, assignments, suppress_line]
+        [
+          io_size_init,
+          io_pos_init,
+          parent_init,
+          root_init,
+          is_le_init,
+          assignments,
+          suppress_line
+        ]
         |> Enum.reject(&is_nil/1)
         |> Enum.join("\n")
 
-      root_data_param = if String.contains?(body, "root_data"), do: "root_data", else: "_root_data"
+      root_data_param =
+        if String.contains?(body, "root_data"), do: "root_data", else: "_root_data"
 
       """
       def resolve_instances(result, #{root_data_param}) do
@@ -2426,7 +2437,8 @@ defmodule Ksc.Compiler.ElixirCompiler do
          _spec,
          _endian,
          _type_registry
-       ), do: field_parses
+       ),
+       do: field_parses
 
   defp interleave_eager_instances(
          field_parses,
