@@ -33,7 +33,7 @@ defmodule ValidateAllTest do
 
     ksy_path = Path.join(@formats_dir, "#{ksy_id}.ksy")
 
-    unless File.exists?(ksy_path) do
+    if !File.exists?(ksy_path) do
       flunk("KSY file not found: #{ksy_path}")
     end
 
@@ -70,7 +70,7 @@ defmodule ValidateAllTest do
         if data_file do
           bin_path = Path.join(@fixtures_dir, data_file)
 
-          unless File.exists?(bin_path) do
+          if !File.exists?(bin_path) do
             flunk("Binary fixture not found: #{bin_path}")
           end
 
@@ -125,7 +125,7 @@ defmodule ValidateAllTest do
         if File.exists?(dep_ksy) do
           mod_name = type |> Macro.camelize()
 
-          unless Code.ensure_loaded?(String.to_atom("Elixir.#{mod_name}")) do
+          if !Code.ensure_loaded?(String.to_atom("Elixir.#{mod_name}")) do
             try do
               Ksc.compile_and_load(dep_ksy)
             rescue

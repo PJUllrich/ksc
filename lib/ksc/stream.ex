@@ -737,4 +737,187 @@ defmodule Ksc.Stream do
   def process_zlib(data) when is_binary(data) do
     :zlib.uncompress(data)
   end
+
+  # ===========================================================================
+  # Writer helpers (mirror of the reader helpers above)
+  # ===========================================================================
+
+  @doc """
+  Write N bits in big-endian bit order into the accumulator state.
+  State is `{bits_acc, bits_left, iodata}`. Returns a new state.
+  """
+  def write_bits_be({bits_acc, bits_left, iodata}, value, num_bits) do
+    new_acc = bor(bsl(bits_acc, num_bits), band(value, bsl(1, num_bits) - 1))
+    new_left = bits_left + num_bits
+    flush_full_bytes_be(new_acc, new_left, iodata)
+  end
+
+  defp flush_full_bytes_be(acc, left, iodata) when left >= 8 do
+    shift = left - 8
+    byte = bsr(acc, shift) |> band(0xFF)
+    new_acc = band(acc, bsl(1, shift) - 1)
+    flush_full_bytes_be(new_acc, shift, [iodata, byte])
+  end
+
+  defp flush_full_bytes_be(acc, left, iodata), do: {acc, left, iodata}
+
+  @doc """
+  Write N bits in little-endian bit order. Bits are accumulated low-end-first.
+  """
+  def write_bits_le({bits_acc, bits_left, iodata}, value, num_bits) do
+    masked = band(value, bsl(1, num_bits) - 1)
+    new_acc = bor(bits_acc, bsl(masked, bits_left))
+    new_left = bits_left + num_bits
+    flush_full_bytes_le(new_acc, new_left, iodata)
+  end
+
+  defp flush_full_bytes_le(acc, left, iodata) when left >= 8 do
+    byte = band(acc, 0xFF)
+    new_acc = bsr(acc, 8)
+    flush_full_bytes_le(new_acc, left - 8, [iodata, byte])
+  end
+
+  defp flush_full_bytes_le(acc, left, iodata), do: {acc, left, iodata}
+
+  @doc """
+  Flush a BE bit accumulator: zero-pad any partial byte at the high-end of the byte.
+  Returns iodata.
+  """
+  def flush_bits_be({_acc, 0, iodata}), do: iodata
+
+  def flush_bits_be({acc, left, iodata}) when left > 0 and left < 8 do
+    byte = bsl(acc, 8 - left) |> band(0xFF)
+    [iodata, byte]
+  end
+
+  @doc """
+  Flush a LE bit accumulator: emit the partial byte (low bits already in place).
+  Returns iodata.
+  """
+  def flush_bits_le({_acc, 0, iodata}), do: iodata
+
+  def flush_bits_le({acc, left, iodata}) when left > 0 and left < 8 do
+    [iodata, band(acc, 0xFF)]
+  end
+
+  @doc """
+  Encode a UTF-8 string back to the target encoding. Inverse of `decode_string/2`.
+  Raises `{:unsupported_write_encoding, enc}` for encodings not yet supported on write.
+  """
+  def encode_string(data, nil), do: data
+  def encode_string(data, "UTF-8"), do: data
+  def encode_string(data, "ASCII"), do: data
+
+  def encode_string(data, encoding) do
+    enc = String.upcase(to_string(encoding))
+
+    case enc do
+      "UTF-8" ->
+        data
+
+      "ASCII" ->
+        data
+
+      "UTF-16LE" ->
+        :unicode.characters_to_binary(data, :utf8, {:utf16, :little})
+
+      "UTF-16BE" ->
+        :unicode.characters_to_binary(data, :utf8, {:utf16, :big})
+
+      _ ->
+        raise ArgumentError, "unsupported write encoding: #{enc}"
+    end
+  end
+
+  @doc """
+  Append the appropriate null terminator for the encoding to already-encoded bytes.
+  Two NUL bytes for UTF-16; one for everything else.
+  """
+  def write_strz(bytes, encoding) do
+    enc = if encoding, do: String.upcase(to_string(encoding)), else: nil
+
+    if enc in ["UTF-16LE", "UTF-16BE"] do
+      <<bytes::binary, 0, 0>>
+    else
+      <<bytes::binary, 0>>
+    end
+  end
+
+  @doc """
+  Pad `bytes` on the right with `pad_byte` until length equals `size`.
+  Raises `{:size_overflow, actual, expected}` if `byte_size(bytes) > size`.
+  """
+  def pad_right_to(bytes, size, pad_byte)
+      when is_binary(bytes) and is_integer(size) and is_integer(pad_byte) do
+    actual = byte_size(bytes)
+
+    cond do
+      actual == size ->
+        bytes
+
+      actual < size ->
+        padding = :binary.copy(<<pad_byte>>, size - actual)
+        <<bytes::binary, padding::binary>>
+
+      true ->
+        raise ArgumentError, "size_overflow: #{actual} bytes does not fit in #{size}"
+    end
+  end
+
+  @doc "Append a single terminator byte to bytes."
+  def append_terminator(bytes, term_byte) when is_binary(bytes) and is_integer(term_byte) do
+    <<bytes::binary, term_byte>>
+  end
+
+  @doc """
+  Append a terminator byte then pad to size (write-side analogue of `terminate_and_pad/4`).
+  The terminator counts toward the size.
+  """
+  def terminate_and_pad_write(bytes, term_byte, size, pad_byte) do
+    bytes |> append_terminator(term_byte) |> pad_right_to(size, pad_byte)
+  end
+
+  @doc "Inverse of process_xor — XOR is self-inverse."
+  def unprocess_xor(data, key), do: process_xor(data, key)
+
+  @doc """
+  Inverse of `process_rotate_left/2`: rotate bytes right by `amount` bits.
+  Equivalent to rotating left by `8 - amount`.
+  """
+  def unprocess_rotate_left(data, amount) when is_binary(data) and is_integer(amount) do
+    process_rotate_left(data, 8 - rem(amount, 8))
+  end
+
+  @doc "Rotate bytes right (inverse direction for the `ror(n)` process)."
+  def unprocess_rotate_right(data, amount) when is_binary(data) and is_integer(amount) do
+    process_rotate_left(data, amount)
+  end
+
+  @doc """
+  Zlib re-compress. Semantically correct round-trip but not byte-identical to the
+  original compressed blob (compression level / dictionary may differ).
+  """
+  def unprocess_zlib(data) when is_binary(data) do
+    :zlib.compress(data)
+  end
+
+  @doc """
+  Write a list of bit-typed values in big-endian bit order. Returns a binary
+  with any trailing partial byte zero-padded.
+  """
+  def repeat_write_bits_be(list, num_bits) when is_list(list) and is_integer(num_bits) do
+    state = Enum.reduce(list, {0, 0, []}, fn v, st -> write_bits_be(st, v, num_bits) end)
+    state |> flush_bits_be() |> IO.iodata_to_binary()
+  end
+
+  @doc "Little-endian variant of `repeat_write_bits_be/2`."
+  def repeat_write_bits_le(list, num_bits) when is_list(list) and is_integer(num_bits) do
+    state = Enum.reduce(list, {0, 0, []}, fn v, st -> write_bits_le(st, v, num_bits) end)
+    state |> flush_bits_le() |> IO.iodata_to_binary()
+  end
+
+  @doc "Reverse an iodata list and flatten to a binary. Used by generated `to_binary/1`."
+  def to_binary_finalize(iodata_rev) when is_list(iodata_rev) do
+    iodata_rev |> :lists.reverse() |> IO.iodata_to_binary()
+  end
 end

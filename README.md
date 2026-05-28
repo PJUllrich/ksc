@@ -56,83 +56,6 @@ result.one
 #=> 42
 ```
 
-## API
-
-### `Ksc.compile(ksy_path)`
-
-Compiles a `.ksy` file into an Elixir source code string. Returns `{:ok, source}`. Useful for inspecting generated code or writing it to a file.
-
-```elixir
-{:ok, source} = Ksc.compile("formats/hello_world.ksy")
-# source is a string containing a defmodule with from_file/1 and from_binary/1
-```
-
-### `Ksc.compile_and_load(ksy_path)`
-
-Compiles a `.ksy` file and loads the resulting module into the VM. Returns `{:ok, module}`. Automatically handles imports (other `.ksy` files referenced by the format).
-
-```elixir
-{:ok, HelloWorld} = Ksc.compile_and_load("formats/hello_world.ksy")
-result = HelloWorld.from_file("data.bin")
-```
-
-### `Ksc.compile_string_and_load(yaml_string)`
-
-Compiles a KSY format from a YAML string and loads it. Convenient for inline or dynamically generated formats.
-
-```elixir
-yaml = """
-meta:
-  id: my_format
-  endian: le
-seq:
-  - id: magic
-    contents: [0x4d, 0x5a]
-  - id: length
-    type: u4
-  - id: name
-    type: str
-    size: length
-    encoding: UTF-8
-"""
-
-{:ok, mod} = Ksc.compile_string_and_load(yaml)
-result = mod.from_binary(<<0x4d, 0x5a, 5, 0, 0, 0, "Hello">>)
-result.length  #=> 5
-result.name    #=> "Hello"
-```
-
-## Generated Module Interface
-
-Every compiled format produces a module with two public functions:
-
-- **`from_file(path)`** - Reads and parses a binary file, returns a map of parsed fields.
-- **`from_binary(binary)`** - Parses a binary directly, returns a map of parsed fields.
-
-The returned map uses atom keys matching the `id` fields in your `.ksy` definition.
-
-## Supported KSY Features
-
-Ksc supports the core Kaitai Struct specification:
-
-- **Primitive types**: `u1`, `u2`, `u4`, `u8`, `s1`, `s2`, `s4`, `s8`, `f4`, `f8`
-- **Endianness**: `le`, `be`, and format-level default endian
-- **Strings**: `str`, `strz`, sized strings, null-terminated strings, encoding support
-- **Byte arrays**: fixed-size, size-from-field, and EOS reads
-- **Enums**: named value mappings with expression support
-- **User-defined types**: nested type definitions and type references
-- **Instances**: computed/lazy fields with value expressions or parsed content
-- **Repetition**: `repeat: eos`, `repeat: expr`, `repeat: until`
-- **Conditionals**: `if` expressions for optional fields
-- **Switch types**: `switch-on` for polymorphic type selection
-- **Imports**: cross-file type references (absolute and relative)
-- **Expressions**: arithmetic, comparison, string, and array operations
-- **Process routines**: `zlib`, `xor`, `rol`, `ror`, and custom process functions
-- **Fixed contents**: magic byte validation
-- **Sized substreams**: `size` and `size-eos` for bounded reads
-- **IO access**: `_io.pos`, `_io.size` for stream introspection
-- **Debug mode**: `ks-debug: true` for partial parsing with error recovery
-
 ## Example: Parsing with Enums
 
 ```yaml
@@ -161,6 +84,65 @@ result.pet_1  #=> :cat
 result.pet_2  #=> :chicken
 ```
 
+## Write-back
+
+Ksc can also serialize a parsed map back into binary. Pass `writer: true` at
+compile time to generate `to_binary/1` and `to_file/2` alongside the readers:
+
+```sh
+mix ksc.compile hello_world.ksy --output lib/formats --writer
+```
+
+or programmatically:
+
+```elixir
+{:ok, mod} = Ksc.compile_and_load("hello_world.ksy", writer: true)
+
+data = mod.from_binary(File.read!("in.bin"))
+data = put_in(data, [:header, :version], 2)
+File.write!("out.bin", mod.to_binary(data))
+```
+
+### Length / count fields
+
+When a `size:` or `repeat-expr:` reads from another seq field (a "controller"),
+the writer overwrites that controller from the actual payload before emitting
+bytes — so you can freely grow or shrink a controlled field without touching
+the length field:
+
+```yaml
+seq:
+  - id: name_len
+    type: u2
+  - id: name
+    size: name_len
+```
+
+```elixir
+m = mod.from_binary(<<5, 0, "hello">>)
+mod.to_binary(%{m | name: "goodbye"})  #=> <<7, 0, "goodbye">>
+#                                                 ^^ writer auto-updated name_len
+```
+
+Supported controller expressions: a bare field reference (`size: foo`) or a
+single arithmetic op with an integer literal (`size: foo + 8`, `size: 100 - foo`,
+`size: foo * 2`, `size: foo / 4`). Multiplicative/divisive forms raise
+`:non_invertible_controller` if the actual length doesn't divide cleanly.
+
+For non-simple expressions (`size: header.x * 2`, `size: 16`), the writer keeps
+strict semantics: pads with `pad-right` (or zero) when the payload is shorter
+than declared, raises `:size_overflow` when longer.
+
+### v1 limitations
+
+- **Encodings on write**: UTF-8, ASCII, UTF-16LE, UTF-16BE. SJIS / IBM437 raise.
+- **Instances are not written**. Value instances (computed from other fields)
+  are recomputed on the next read. Positional instances are lost on write-back.
+- **`process: zlib`** writes are semantically correct but not byte-identical
+  (re-compression).
+- **Custom `process:` modules** must implement `encode/2` for write-back.
+- **Switch types with no `_` case**: rely on parser-stashed raw bytes in the map.
+
 ## Running Tests
 
 Ksc uses the official [Kaitai Struct test suite](https://github.com/kaitai-io/kaitai_struct_tests) for validation.
@@ -168,4 +150,17 @@ Ksc uses the official [Kaitai Struct test suite](https://github.com/kaitai-io/ka
 ```sh
 mix deps.get
 mix test
+```
+
+Additional write-back test suites (opt-in via tag):
+
+```sh
+# Broad round-trip test: parse → to_binary → from_binary → assert equal
+mix test --only writer_roundtrip
+
+# Broad mutation test: parse → mutate every field → to_binary → from_binary → assert equal
+mix test --only writer_mutation
+
+# Reproduce a specific mutation seed
+MUTATION_SEED=42 mix test --only writer_mutation
 ```

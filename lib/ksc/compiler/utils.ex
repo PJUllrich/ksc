@@ -11,11 +11,6 @@ defmodule Ksc.Compiler.Utils do
 
   def to_module_name(_), do: "Unknown"
 
-  @doc "Ensure a field name is a valid Elixir atom-safe identifier."
-  def to_field_name(id) when is_binary(id) do
-    String.to_atom(id)
-  end
-
   @doc "Indent a block of code by the given number of spaces."
   def indent(code, level) when is_binary(code) and is_integer(level) do
     prefix = String.duplicate("  ", level)

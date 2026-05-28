@@ -35,4 +35,33 @@ defmodule KscTest do
     result = mod.from_binary(<<42>>)
     assert result.val == 42
   end
+
+  describe "writer: option" do
+    @yaml """
+    meta:
+      id: writer_gate_test
+    seq:
+      - id: val
+        type: u1
+    """
+
+    test "writer: false (default) does NOT emit to_binary" do
+      {:ok, source} = Ksc.compile_string(@yaml)
+      refute String.contains?(source, "def to_binary")
+      refute String.contains?(source, "def to_file")
+    end
+
+    test "writer: true emits to_binary and to_file" do
+      {:ok, source} = Ksc.compile_string(@yaml, writer: true)
+      assert String.contains?(source, "def to_binary")
+      assert String.contains?(source, "def to_file")
+    end
+
+    test "compile_string_and_load with writer: true exposes to_binary/1" do
+      ns = "KWG#{:erlang.unique_integer([:positive])}"
+      {:ok, mod} = Ksc.compile_string_and_load(@yaml, namespace: ns, writer: true)
+      assert function_exported?(mod, :to_binary, 1)
+      assert function_exported?(mod, :to_file, 2)
+    end
+  end
 end

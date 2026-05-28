@@ -13,11 +13,13 @@ defmodule Ksc do
 
   Options:
     - `:namespace` — module namespace prefix to apply to all generated modules
+    - `:writer` — when `true`, also generate `to_binary/1` and `to_file/2` on
+      every non-parameterised module. Default `false`.
   """
   def compile(ksy_path, opts \\ []) do
     module_pairs =
       ksy_path
-      |> compile_modules()
+      |> compile_modules(opts)
       |> Enum.reverse()
       |> Enum.uniq_by(fn {name, _} -> name end)
       |> Enum.reverse()
@@ -100,6 +102,7 @@ defmodule Ksc do
   - `output_dir` — directory where `.ex` files are written (created if it doesn't exist)
   - `opts` — keyword list of options:
     - `:namespace` — module namespace prefix (default: `"Ksc.Compiled"`)
+    - `:writer` — when `true`, also generate `to_binary/1` + `to_file/2`. Default `false`.
 
   Returns `{:ok, [written_file_paths]}` or `{:error, reason}`.
   """
@@ -130,7 +133,7 @@ defmodule Ksc do
 
         modules =
           files
-          |> Enum.flat_map(&compile_modules/1)
+          |> Enum.flat_map(&compile_modules(&1, opts))
           |> Enum.uniq_by(fn {mod_name, _source} -> mod_name end)
 
         all_mod_names = Enum.map(modules, fn {name, _} -> name end)
@@ -164,7 +167,7 @@ defmodule Ksc do
     )
   end
 
-  defp compile_modules(ksy_path) do
+  defp compile_modules(ksy_path, opts) do
     spec = Parser.parse_file(ksy_path)
     formats_dir = Path.dirname(ksy_path)
 
@@ -178,23 +181,24 @@ defmodule Ksc do
         formats_dir,
         [],
         MapSet.new(),
-        merged_spec.enums
+        merged_spec.enums,
+        opts
       )
 
-    main_source = ElixirCompiler.compile(merged_spec)
+    main_source = ElixirCompiler.compile(merged_spec, opts)
     main_mod_name = Ksc.Compiler.Utils.to_module_name(spec.id)
 
     import_module_pairs ++ [{main_mod_name, main_source}]
   end
 
-  defp compile_import_modules([], _dir, _root_dir, acc, _seen, _parent_enums),
+  defp compile_import_modules([], _dir, _root_dir, acc, _seen, _parent_enums, _opts),
     do: Enum.reverse(acc)
 
-  defp compile_import_modules([imp | rest], dir, root_dir, acc, seen, parent_enums) do
+  defp compile_import_modules([imp | rest], dir, root_dir, acc, seen, parent_enums, opts) do
     {imp_name, resolve_dir} = resolve_import_dir(imp, dir, root_dir)
 
     if MapSet.member?(seen, imp_name) do
-      compile_import_modules(rest, dir, root_dir, acc, seen, parent_enums)
+      compile_import_modules(rest, dir, root_dir, acc, seen, parent_enums, opts)
     else
       seen = MapSet.put(seen, imp_name)
       ksy_path = find_import(imp_name, resolve_dir)
@@ -206,9 +210,9 @@ defmodule Ksc do
         sub_dir = Path.dirname(ksy_path)
 
         sub_pairs =
-          compile_import_modules(spec.imports, sub_dir, root_dir, [], seen, merged_enums)
+          compile_import_modules(spec.imports, sub_dir, root_dir, [], seen, merged_enums, opts)
 
-        source = ElixirCompiler.compile(spec)
+        source = ElixirCompiler.compile(spec, opts)
         mod_name = Ksc.Compiler.Utils.to_module_name(spec.id)
 
         compile_import_modules(
@@ -217,10 +221,11 @@ defmodule Ksc do
           root_dir,
           [{mod_name, source} | sub_pairs] ++ acc,
           seen,
-          parent_enums
+          parent_enums,
+          opts
         )
       else
-        compile_import_modules(rest, dir, root_dir, acc, seen, parent_enums)
+        compile_import_modules(rest, dir, root_dir, acc, seen, parent_enums, opts)
       end
     end
   end
@@ -231,6 +236,7 @@ defmodule Ksc do
 
   Options:
     - `:namespace` — module namespace prefix to apply to all generated modules
+    - `:writer` — when `true`, also generate `to_binary/1` and `to_file/2`. Default `false`.
   """
   def compile_and_load(ksy_path, opts \\ []) do
     case compile(ksy_path, opts) do
@@ -246,14 +252,13 @@ defmodule Ksc do
   end
 
   @doc """
-  Compile a KSY YAML string and load the resulting module.
+  Compile a KSY YAML string into Elixir source code (without loading it).
 
-  Options:
-    - `:namespace` — module namespace prefix to apply to the generated module
+  Options match `compile/2`.
   """
-  def compile_string_and_load(yaml_string, opts \\ []) do
+  def compile_string(yaml_string, opts \\ []) do
     spec = Parser.parse_string(yaml_string)
-    source = ElixirCompiler.compile(spec)
+    source = ElixirCompiler.compile(spec, opts)
     namespace = opts[:namespace]
 
     source =
@@ -264,6 +269,18 @@ defmodule Ksc do
         source
       end
 
+    {:ok, source}
+  end
+
+  @doc """
+  Compile a KSY YAML string and load the resulting module.
+
+  Options:
+    - `:namespace` — module namespace prefix to apply to the generated module
+    - `:writer` — when `true`, also generate `to_binary/1` and `to_file/2`. Default `false`.
+  """
+  def compile_string_and_load(yaml_string, opts \\ []) do
+    {:ok, source} = compile_string(yaml_string, opts)
     modules = Code.compile_string(source)
     {module, _binary} = List.last(modules)
     {:ok, module}
