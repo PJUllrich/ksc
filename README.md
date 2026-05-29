@@ -13,7 +13,7 @@ Add `ksc` to your dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:ksc, "~> 0.1.0"}
+    {:ksc, "~> 0.2.1"}
   ]
 end
 ```
@@ -139,7 +139,9 @@ than declared, raises `:size_overflow` when longer.
 
 ### v1 limitations
 
-- **Encodings on write**: UTF-8, ASCII, UTF-16LE, UTF-16BE. SJIS / IBM437 raise.
+- **Encodings on write**: UTF-8, ASCII, UTF-16LE, UTF-16BE, Windows-1252,
+  ISO-8859-1. SJIS / IBM437 raise. (On read, all of these decode; an unsupported
+  encoding raises rather than returning raw bytes.)
 - **Instances are not written**. Value instances (computed from other fields)
   are recomputed on the next read. Positional instances are lost on write-back.
 - **`process: zlib`** writes are semantically correct but not byte-identical

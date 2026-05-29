@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.2.1 — 2026-05-29
+
+### Added
+
+- Windows-1252 and ISO-8859-1 (Latin-1) string encodings, on both read and write.
+
+### Changed
+
+- Reading a string in an unsupported encoding now raises instead of silently
+  returning the raw, undecoded bytes (which produced invalid UTF-8 downstream).
+
 ## v0.2.0 — 2026-05-29
 
 - **Write-back.** Compile with `writer: true` (`--writer`) to generate

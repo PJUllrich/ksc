@@ -428,8 +428,14 @@ defmodule Ksc.Stream do
       "IBM437" ->
         decode_ibm437(data)
 
+      enc when enc in ["WINDOWS-1252", "CP1252"] ->
+        decode_cp1252(data)
+
+      enc when enc in ["ISO-8859-1", "ISO8859-1", "LATIN1", "LATIN-1"] ->
+        decode_latin1(data)
+
       _ ->
-        data
+        raise ArgumentError, "unsupported encoding: #{inspect(encoding)}"
     end
   end
 
@@ -735,6 +741,81 @@ defmodule Ksc.Stream do
     Map.get(table, b, 0xFFFD)
   end
 
+  # Windows-1252 differs from ISO-8859-1 only in 0x80..0x9F, where it defines
+  # printable typographic characters (curly quotes, dashes, the euro sign, ...).
+  # The five undefined positions (0x81, 0x8D, 0x8F, 0x90, 0x9D) fall through to
+  # their own byte value, matching ISO-8859-1, so they still round-trip.
+  @cp1252_high %{
+    0x80 => 0x20AC,
+    0x82 => 0x201A,
+    0x83 => 0x0192,
+    0x84 => 0x201E,
+    0x85 => 0x2026,
+    0x86 => 0x2020,
+    0x87 => 0x2021,
+    0x88 => 0x02C6,
+    0x89 => 0x2030,
+    0x8A => 0x0160,
+    0x8B => 0x2039,
+    0x8C => 0x0152,
+    0x8E => 0x017D,
+    0x91 => 0x2018,
+    0x92 => 0x2019,
+    0x93 => 0x201C,
+    0x94 => 0x201D,
+    0x95 => 0x2022,
+    0x96 => 0x2013,
+    0x97 => 0x2014,
+    0x98 => 0x02DC,
+    0x99 => 0x2122,
+    0x9A => 0x0161,
+    0x9B => 0x203A,
+    0x9C => 0x0153,
+    0x9E => 0x017E,
+    0x9F => 0x0178
+  }
+  @cp1252_reverse Map.new(@cp1252_high, fn {byte, cp} -> {cp, byte} end)
+
+  defp decode_cp1252(data) do
+    for <<b <- data>>, into: <<>>, do: <<cp1252_codepoint(b)::utf8>>
+  end
+
+  defp cp1252_codepoint(b) when b in 0x80..0x9F, do: Map.get(@cp1252_high, b, b)
+  defp cp1252_codepoint(b), do: b
+
+  defp encode_cp1252(data) do
+    for <<cp::utf8 <- data>>, into: <<>>, do: <<cp1252_byte(cp)>>
+  end
+
+  defp cp1252_byte(cp) when cp <= 0xFF, do: cp
+
+  defp cp1252_byte(cp) do
+    case Map.get(@cp1252_reverse, cp) do
+      nil ->
+        raise ArgumentError, "codepoint U+#{int_to_hex(cp)} not representable in windows-1252"
+
+      byte ->
+        byte
+    end
+  end
+
+  # ISO-8859-1 (Latin-1): bytes 0x00..0xFF map straight to U+0000..U+00FF.
+  defp decode_latin1(data) do
+    for <<b <- data>>, into: <<>>, do: <<b::utf8>>
+  end
+
+  defp encode_latin1(data) do
+    for <<cp::utf8 <- data>>, into: <<>>, do: <<latin1_byte(cp)>>
+  end
+
+  defp latin1_byte(cp) when cp <= 0xFF, do: cp
+
+  defp latin1_byte(cp) do
+    raise ArgumentError, "codepoint U+#{int_to_hex(cp)} not representable in ISO-8859-1"
+  end
+
+  defp int_to_hex(cp), do: cp |> Integer.to_string(16) |> String.pad_leading(4, "0")
+
   @doc "KSY add operator - string concat or arithmetic add."
   def kaitai_add(a, b) when is_binary(a) and is_binary(b), do: a <> b
   def kaitai_add(a, b) when is_binary(a), do: a <> to_string(b)
@@ -832,6 +913,12 @@ defmodule Ksc.Stream do
 
       "UTF-16BE" ->
         :unicode.characters_to_binary(data, :utf8, {:utf16, :big})
+
+      enc when enc in ["WINDOWS-1252", "CP1252"] ->
+        encode_cp1252(data)
+
+      enc when enc in ["ISO-8859-1", "ISO8859-1", "LATIN1", "LATIN-1"] ->
+        encode_latin1(data)
 
       _ ->
         raise ArgumentError, "unsupported write encoding: #{enc}"
