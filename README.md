@@ -1,6 +1,10 @@
 # Ksc
 
-An Elixir implementation of the [Kaitai Struct](https://kaitai.io/) compiler and runtime. Ksc compiles `.ksy` format descriptions into Elixir modules that parse binary data into structured maps.
+An Elixir implementation of the [Kaitai Struct](https://kaitai.io/) compiler and runtime. Ksc:
+
+- **Compiles** `.ksy` format descriptions into Elixir modules.
+- **Parses** binary data into structured maps with those modules.
+- **Writes back** — serializes a parsed (and possibly modified) map into its binary form.
 
 ## Installation
 

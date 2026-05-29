@@ -2779,37 +2779,21 @@ defmodule Ksc.Compiler.ElixirCompiler do
         compile_group_write(group, parse_endian, type_registry, spec, bit_endian)
       end)
 
-    params = spec.params || []
-    param_names = Enum.map(params, fn p -> "var_#{p.id}" end)
+    param_names = Enum.map(spec.params || [], fn p -> "var_#{p.id}" end)
 
     # Suppress unused-warning for params that aren't referenced.
-    param_suppress =
-      param_names
-      |> Enum.map(fn n -> "_ = #{n}" end)
-      |> Enum.join("\n")
-
-    args_str =
-      ["map_", "parent_", "root_"]
-      |> Kernel.++(param_names)
-      |> Enum.join(", ")
+    param_suppress = Enum.map_join(param_names, "\n", &"_ = #{&1}")
+    args_str = Enum.join(["map_", "parent_", "root_"] ++ param_names, ", ")
 
     field_writes_joined = Enum.join(field_writes, "\n")
     all_code = field_writes_joined <> "\n" <> ctrl_code
 
     # If write-side expressions reference io_pos / io_size, define them up-front
     # using whatever the parser stashed in the map.
-    needs_io_size = Regex.match?(~r/(?<![_\w])io_size\b/, all_code)
-    needs_io_pos = Regex.match?(~r/(?<![_\w])io_pos\b/, all_code)
-
     io_size_init =
-      if needs_io_size,
-        do: "io_size = byte_size(map_[:_io_data] || <<>>)\n_ = io_size",
-        else: nil
+      io_var_init("io_size", "io_size = byte_size(map_[:_io_data] || <<>>)", all_code)
 
-    io_pos_init =
-      if needs_io_pos,
-        do: "io_pos = map_[:_io_pos] || 0\n_ = io_pos",
-        else: nil
+    io_pos_init = io_var_init("io_pos", "io_pos = map_[:_io_pos] || 0", all_code)
 
     body =
       [
@@ -2873,72 +2857,74 @@ defmodule Ksc.Compiler.ElixirCompiler do
   end
 
   defp compile_group_write({:bit_run, bit_attrs}, endian, type_registry, spec, bit_endian) do
-    default_be = if bit_endian == "le", do: :le, else: :be
+    default = if bit_endian == "le", do: :le, else: :be
+    endians = Enum.map(bit_attrs, &bit_field_endian(&1, endian, type_registry, spec, default))
 
-    attr_endians =
-      Enum.map(bit_attrs, fn attr ->
-        {_match, bit_info} = type_to_pattern(attr.type, endian, attr, type_registry, spec)
-
-        case bit_info do
-          {:bit, _s, e} when e != nil -> e
-          _ -> default_be
-        end
-      end)
-
+    # Walk the run carrying the previous field's bit order so we know when to
+    # flush and realign the accumulator between opposite-endian fields.
     {field_codes, _prev} =
-      Enum.zip(bit_attrs, attr_endians)
+      bit_attrs
+      |> Enum.zip(endians)
       |> Enum.map_reduce(nil, fn {attr, field_endian}, prev ->
         {_match, {:bit, bit_size, _}} =
           type_to_pattern(attr.type, endian, attr, type_registry, spec)
 
-        bit_fn = if field_endian == :le, do: "write_bits_le", else: "write_bits_be"
-
-        realign =
-          if prev != nil and prev != field_endian do
-            prev_flush = if prev == :le, do: "flush_bits_le", else: "flush_bits_be"
-
-            "out_ = [Ksc.Stream.#{prev_flush}(bit_st_) | out_]\nbit_st_ = {0, 0, []}\n"
-          else
-            ""
-          end
-
-        val_expr =
-          cond do
-            bit_size == 1 and attr.enum == nil ->
-              "if(map_[:#{attr.id}], do: 1, else: 0)"
-
-            attr.enum != nil ->
-              writer_unwrap_enum_expr(attr.enum, "map_[:#{attr.id}]")
-
-            true ->
-              "map_[:#{attr.id}]"
-          end
-
-        push =
-          if attr.if_expr != nil do
-            cond_expr = translate_expr_for_instance(attr.if_expr)
-
-            """
-            bit_st_ = if #{cond_expr} do
-              Ksc.Stream.#{bit_fn}(bit_st_, #{val_expr}, #{bit_size})
-            else
-              bit_st_
-            end
-            """
-            |> String.trim()
-          else
-            "bit_st_ = Ksc.Stream.#{bit_fn}(bit_st_, #{val_expr}, #{bit_size})"
-          end
-
-        {realign <> push, field_endian}
+        code = realign_bits(prev, field_endian) <> write_bit_field(attr, field_endian, bit_size)
+        {code, field_endian}
       end)
 
-    final_endian = List.last(attr_endians) || default_be
-    flush_fn = if final_endian == :le, do: "flush_bits_le", else: "flush_bits_be"
-    final_flush = "out_ = [Ksc.Stream.#{flush_fn}(bit_st_) | out_]"
+    final_endian = List.last(endians) || default
+    final_flush = "out_ = [Ksc.Stream.#{bit_flush_fn(final_endian)}(bit_st_) | out_]"
 
     Enum.join(["bit_st_ = {0, 0, []}" | field_codes] ++ [final_flush], "\n")
   end
+
+  defp bit_write_fn(:le), do: "write_bits_le"
+  defp bit_write_fn(_), do: "write_bits_be"
+
+  defp bit_flush_fn(:le), do: "flush_bits_le"
+  defp bit_flush_fn(_), do: "flush_bits_be"
+
+  # The bit order for a single field in a run: its own override, else the run default.
+  defp bit_field_endian(attr, endian, type_registry, spec, default) do
+    case type_to_pattern(attr.type, endian, attr, type_registry, spec) do
+      {_match, {:bit, _size, e}} when e != nil -> e
+      _ -> default
+    end
+  end
+
+  # When the bit order flips mid-run, flush the accumulated bits and start fresh.
+  defp realign_bits(prev, endian) when prev in [nil, endian], do: ""
+
+  defp realign_bits(prev, _endian),
+    do: "out_ = [Ksc.Stream.#{bit_flush_fn(prev)}(bit_st_) | out_]\nbit_st_ = {0, 0, []}\n"
+
+  defp write_bit_field(attr, endian, bit_size) do
+    push =
+      "Ksc.Stream.#{bit_write_fn(endian)}(bit_st_, #{bit_value_expr(attr, bit_size)}, #{bit_size})"
+
+    if attr.if_expr do
+      """
+      bit_st_ = if #{translate_expr_for_instance(attr.if_expr)} do
+        #{push}
+      else
+        bit_st_
+      end
+      """
+      |> String.trim()
+    else
+      "bit_st_ = #{push}"
+    end
+  end
+
+  # 1-bit fields round-trip booleans; enums unwrap to their integer value.
+  defp bit_value_expr(%AttrSpec{enum: nil} = attr, 1),
+    do: "if(#{field_read(attr.id)}, do: 1, else: 0)"
+
+  defp bit_value_expr(%AttrSpec{enum: nil} = attr, _bits), do: field_read(attr.id)
+
+  defp bit_value_expr(%AttrSpec{enum: enum} = attr, _bits),
+    do: writer_unwrap_enum_expr(enum, field_read(attr.id))
 
   defp compile_attr_write(%AttrSpec{} = attr, endian, type_registry, spec) do
     cond do
@@ -2952,8 +2938,7 @@ defmodule Ksc.Compiler.ElixirCompiler do
         compile_conditional_write(attr, endian, type_registry, spec)
 
       true ->
-        val_expr = "map_[:#{attr.id}]"
-        compile_simple_write(attr, val_expr, endian, type_registry, spec)
+        compile_simple_write(attr, field_read(attr.id), endian, type_registry, spec)
     end
   end
 
@@ -2974,7 +2959,7 @@ defmodule Ksc.Compiler.ElixirCompiler do
     # condition evaluates against the post-parse map.
     """
     out_ =
-      if map_[:#{attr.id}] != nil and (#{cond_expr}) do
+      if #{field_read(attr.id)} != nil and (#{cond_expr}) do
         #{Utils.indent(inner, 2)}
         out_
       else
@@ -2991,7 +2976,7 @@ defmodule Ksc.Compiler.ElixirCompiler do
       {_, {:bit, bit_size, bit_endian}} ->
         suffix = if bit_endian == :le, do: "le", else: "be"
 
-        "out_ = [Ksc.Stream.repeat_write_bits_#{suffix}(map_[:#{attr.id}], #{bit_size}) | out_]"
+        "out_ = [Ksc.Stream.repeat_write_bits_#{suffix}(#{field_read(attr.id)}, #{bit_size}) | out_]"
 
       _ ->
         inner = compile_simple_write(inner_attr, "item_", endian, type_registry, spec)
@@ -2999,7 +2984,7 @@ defmodule Ksc.Compiler.ElixirCompiler do
 
         if needs_index do
           """
-          out_ = Enum.reduce(Enum.with_index(map_[:#{attr.id}] || []), out_, fn {item_, var__index}, out_ ->
+          out_ = Enum.reduce(Enum.with_index(#{field_read(attr.id)} || []), out_, fn {item_, var__index}, out_ ->
             _ = var__index
             #{Utils.indent(inner, 1)}
             out_
@@ -3008,7 +2993,7 @@ defmodule Ksc.Compiler.ElixirCompiler do
           |> String.trim()
         else
           """
-          out_ = Enum.reduce(map_[:#{attr.id}] || [], out_, fn item_, out_ ->
+          out_ = Enum.reduce(#{field_read(attr.id)} || [], out_, fn item_, out_ ->
             #{Utils.indent(inner, 1)}
             out_
           end)
@@ -3108,43 +3093,34 @@ defmodule Ksc.Compiler.ElixirCompiler do
     # parsed value, so don't re-append. When `consume: false`, the next field's
     # data starts with the terminator byte; don't re-append.
     inverse_step =
-      cond do
-        has_term and not include and not consume_false ->
-          "val_ = Ksc.Stream.terminate_and_pad_write(val_, #{attr.terminator}, #{size_expr}, #{pad_byte})"
-
-        true ->
-          "val_ = Ksc.Stream.pad_right_to(val_, #{size_expr}, #{pad_byte})"
+      if has_term and not include and not consume_false do
+        "val_ = Ksc.Stream.terminate_and_pad_write(val_, #{attr.terminator}, #{size_expr}, #{pad_byte})"
+      else
+        "val_ = Ksc.Stream.pad_right_to(val_, #{size_expr}, #{pad_byte})"
       end
 
-    parts = [
+    write_block([
       "val_ = #{val_expr}",
       maybe_process_inverse(attr, "val_"),
       inverse_step,
       "out_ = [val_ | out_]"
-    ]
-
-    parts |> Enum.reject(&(&1 in [nil, ""])) |> Enum.join("\n")
+    ])
   end
 
   defp compile_bytes_eos_write(%AttrSpec{} = attr, val_expr) do
-    parts = [
+    write_block([
       "val_ = #{val_expr}",
       maybe_process_inverse(attr, "val_"),
       "out_ = [val_ | out_]"
-    ]
-
-    parts |> Enum.reject(&(&1 in [nil, ""])) |> Enum.join("\n")
+    ])
   end
 
   defp compile_str_sized_write(%AttrSpec{} = attr, val_expr, spec) do
     size_expr = translate_expr_for_instance(attr.size)
-    enc = resolve_encoding(attr, spec)
-    enc_str = if enc, do: "\"#{enc}\"", else: "nil"
+    enc_str = enc_literal(attr, spec)
     pad_byte = attr.pad_right || 0
 
-    base = ["val_ = Ksc.Stream.encode_string(#{val_expr}, #{enc_str})"]
-
-    extra =
+    term_and_pad =
       cond do
         attr.terminator != nil and attr.pad_right != nil ->
           [
@@ -3161,76 +3137,53 @@ defmodule Ksc.Compiler.ElixirCompiler do
           ["val_ = Ksc.Stream.pad_right_to(val_, #{size_expr}, #{pad_byte})"]
       end
 
-    (base ++ extra ++ ["out_ = [val_ | out_]"])
-    |> Enum.reject(&(&1 in [nil, ""]))
-    |> Enum.join("\n")
+    write_block(
+      ["val_ = Ksc.Stream.encode_string(#{val_expr}, #{enc_str})"] ++
+        term_and_pad ++ ["out_ = [val_ | out_]"]
+    )
   end
 
   defp compile_str_eos_write(%AttrSpec{} = attr, val_expr, spec) do
-    enc = resolve_encoding(attr, spec)
-    enc_str = if enc, do: "\"#{enc}\"", else: "nil"
-
-    """
-    val_ = Ksc.Stream.encode_string(#{val_expr}, #{enc_str})
-    out_ = [val_ | out_]
-    """
-    |> String.trim()
+    write_block([
+      "val_ = Ksc.Stream.encode_string(#{val_expr}, #{enc_literal(attr, spec)})",
+      "out_ = [val_ | out_]"
+    ])
   end
 
   defp compile_strz_write(%AttrSpec{} = attr, val_expr, spec) do
-    enc = resolve_encoding(attr, spec)
-    enc_str = if enc, do: "\"#{enc}\"", else: "nil"
+    enc_str = enc_literal(attr, spec)
     # Skip the strz terminator when consume: false (next field's first byte(s)
     # are the terminator) or include: true (terminator already in the value).
     skip_term = attr.consume == false or attr.include == true
+    term_line = unless skip_term, do: "val_ = Ksc.Stream.write_strz(val_, #{enc_str})"
 
-    term_line =
-      if skip_term, do: nil, else: "val_ = Ksc.Stream.write_strz(val_, #{enc_str})"
+    pad_line =
+      if attr.size != nil do
+        size_expr = translate_expr_for_instance(attr.size)
+        "val_ = Ksc.Stream.pad_right_to(val_, #{size_expr}, #{attr.pad_right || 0})"
+      end
 
-    if attr.size != nil do
-      size_expr = translate_expr_for_instance(attr.size)
-      pad_byte = attr.pad_right || 0
-
-      [
-        "val_ = Ksc.Stream.encode_string(#{val_expr}, #{enc_str})",
-        term_line,
-        "val_ = Ksc.Stream.pad_right_to(val_, #{size_expr}, #{pad_byte})",
-        "out_ = [val_ | out_]"
-      ]
-      |> Enum.reject(&is_nil/1)
-      |> Enum.join("\n")
-    else
-      [
-        "val_ = Ksc.Stream.encode_string(#{val_expr}, #{enc_str})",
-        term_line,
-        "out_ = [val_ | out_]"
-      ]
-      |> Enum.reject(&is_nil/1)
-      |> Enum.join("\n")
-    end
+    write_block([
+      "val_ = Ksc.Stream.encode_string(#{val_expr}, #{enc_str})",
+      term_line,
+      pad_line,
+      "out_ = [val_ | out_]"
+    ])
   end
 
   defp compile_terminated_write(%AttrSpec{} = attr, val_expr, spec) do
-    enc = resolve_encoding(attr, spec)
-    enc_str = if enc, do: "\"#{enc}\"", else: "nil"
-    include = attr.include == true
-    # consume: false means the terminator was left in the stream — the next field
-    # will provide it as its first byte. Don't re-emit it here.
-    consume_false = attr.consume == false
+    # Re-append the terminator unless it's already part of the read value
+    # (include: true) or the next field will provide it (consume: false).
+    skip_term = attr.include == true or attr.consume == false
 
-    base = ["val_ = Ksc.Stream.encode_string(#{val_expr}, #{enc_str})"]
+    term_line =
+      unless skip_term, do: "val_ = Ksc.Stream.append_terminator(val_, #{attr.terminator})"
 
-    append =
-      cond do
-        # Terminator already part of the read value (include: true).
-        include -> []
-        # Next field's data starts with the terminator byte.
-        consume_false -> []
-        true -> ["val_ = Ksc.Stream.append_terminator(val_, #{attr.terminator})"]
-      end
-
-    (base ++ append ++ ["out_ = [val_ | out_]"])
-    |> Enum.join("\n")
+    write_block([
+      "val_ = Ksc.Stream.encode_string(#{val_expr}, #{enc_literal(attr, spec)})",
+      term_line,
+      "out_ = [val_ | out_]"
+    ])
   end
 
   defp compile_user_type_write(%AttrSpec{} = attr, val_expr, endian, type_registry, spec) do
@@ -3252,48 +3205,29 @@ defmodule Ksc.Compiler.ElixirCompiler do
     child_call = "#{type_mod}.to_binary(#{val_expr}, #{parent_ref}, #{root_ref}#{args_str})"
     _ = endian
 
-    cond do
-      attr.size != nil ->
-        size_expr = translate_expr_for_instance(attr.size)
-        # If the outer has no pad-right but the inner type's first seq field does,
-        # inherit it so size-eos inner strings round-trip correctly.
-        pad_byte = attr.pad_right || inner_pad_byte(base_type, spec) || 0
+    framing =
+      cond do
+        attr.size != nil ->
+          size_expr = translate_expr_for_instance(attr.size)
+          # If the outer has no pad-right but the inner type's first seq field does,
+          # inherit it so size-eos inner strings round-trip correctly.
+          pad_byte = attr.pad_right || inner_pad_byte(base_type, spec) || 0
+          "val_ = Ksc.Stream.pad_right_to(val_, #{size_expr}, #{pad_byte})"
 
-        parts = [
-          "val_ = #{child_call}",
-          maybe_process_inverse(attr, "val_"),
-          "val_ = Ksc.Stream.pad_right_to(val_, #{size_expr}, #{pad_byte})",
-          "out_ = [val_ | out_]"
-        ]
+        attr.terminator != nil ->
+          skip_term = attr.include == true or attr.consume == false
+          unless skip_term, do: "val_ = Ksc.Stream.append_terminator(val_, #{attr.terminator})"
 
-        parts |> Enum.reject(&(&1 in [nil, ""])) |> Enum.join("\n")
+        true ->
+          nil
+      end
 
-      attr.terminator != nil ->
-        skip_term = attr.include == true or attr.consume == false
-
-        term_line =
-          if skip_term,
-            do: nil,
-            else: "val_ = Ksc.Stream.append_terminator(val_, #{attr.terminator})"
-
-        parts = [
-          "val_ = #{child_call}",
-          maybe_process_inverse(attr, "val_"),
-          term_line,
-          "out_ = [val_ | out_]"
-        ]
-
-        parts |> Enum.reject(&(&1 in [nil, ""])) |> Enum.join("\n")
-
-      true ->
-        parts = [
-          "val_ = #{child_call}",
-          maybe_process_inverse(attr, "val_"),
-          "out_ = [val_ | out_]"
-        ]
-
-        parts |> Enum.reject(&(&1 in [nil, ""])) |> Enum.join("\n")
-    end
+    write_block([
+      "val_ = #{child_call}",
+      maybe_process_inverse(attr, "val_"),
+      framing,
+      "out_ = [val_ | out_]"
+    ])
   end
 
   defp compile_switch_write(%AttrSpec{} = attr, val_expr, endian, type_registry, spec) do
@@ -3342,6 +3276,34 @@ defmodule Ksc.Compiler.ElixirCompiler do
     |> String.trim()
   end
 
+  # Source expression that reads field `id` from the writer's input map. We use
+  # `Map.get/2` rather than the `map_[:id]` access syntax because, on a plain
+  # map, it skips the `Access` dispatch — measurably cheaper on the hot per-field
+  # write path while behaving identically (a missing key still yields `nil`).
+  defp field_read(id), do: "Map.get(map_, :#{id})"
+
+  # Join write-step lines into one block, dropping nil/empty entries. Lets the
+  # `compile_*_write` builders list their steps and skip the inapplicable ones
+  # without each repeating the same reject/join dance.
+  defp write_block(steps) do
+    steps |> Enum.reject(&(&1 in [nil, ""])) |> Enum.join("\n")
+  end
+
+  # Hoist an `io_size`/`io_pos` definition to the top of the writer, but only
+  # when `code` actually references the bare variable. Returns nil otherwise.
+  defp io_var_init(name, definition, code) do
+    if Regex.match?(~r/(?<![_\w])#{name}\b/, code), do: "#{definition}\n_ = #{name}"
+  end
+
+  # The encoding name as an Elixir literal (a quoted string, or `nil`), ready to
+  # splice into a generated `Ksc.Stream` call.
+  defp enc_literal(%AttrSpec{} = attr, spec) do
+    case resolve_encoding(attr, spec) do
+      nil -> "nil"
+      enc -> ~s("#{enc}")
+    end
+  end
+
   defp writer_unwrap_enum_expr(nil, val_expr), do: val_expr
 
   defp writer_unwrap_enum_expr(enum_name, val_expr) when is_binary(enum_name) do
@@ -3364,42 +3326,36 @@ defmodule Ksc.Compiler.ElixirCompiler do
 
   defp maybe_process_inverse(%AttrSpec{process: nil}, _var), do: ""
 
+  defp maybe_process_inverse(%AttrSpec{process: "zlib"}, var) do
+    "#{var} = Ksc.Stream.unprocess_zlib(#{var})"
+  end
+
   defp maybe_process_inverse(%AttrSpec{process: process}, var) when is_binary(process) do
-    cond do
-      Regex.match?(~r/^xor\(/, process) ->
-        arg = extract_process_arg(process)
-        "#{var} = Ksc.Stream.unprocess_xor(#{var}, #{translate_expr_for_instance(arg)})"
-
-      process == "zlib" ->
-        "#{var} = Ksc.Stream.unprocess_zlib(#{var})"
-
-      Regex.match?(~r/^rotate_left\(/, process) ->
-        arg = extract_process_arg(process)
-        "#{var} = Ksc.Stream.unprocess_rotate_left(#{var}, #{translate_expr_for_instance(arg)})"
-
-      Regex.match?(~r/^rol\(/, process) ->
-        arg = extract_process_arg(process)
-        "#{var} = Ksc.Stream.unprocess_rotate_left(#{var}, #{translate_expr_for_instance(arg)})"
-
-      Regex.match?(~r/^ror\(/, process) ->
-        arg = extract_process_arg(process)
-
-        "#{var} = Ksc.Stream.process_rotate_left(#{var}, #{translate_expr_for_instance(arg)})"
-
-      true ->
-        {mod_name, args} = parse_custom_process(process)
-
-        args_str =
-          if args != [],
-            do: Enum.map_join(args, ", ", &translate_expr_for_instance/1),
-            else: ""
-
-        "process = #{mod_name}.new(#{args_str})\n" <>
-          "#{var} = #{mod_name}.encode(process, #{var})"
+    # The built-in processes are `name(arg)` calls; dispatch on the name and
+    # emit the matching inverse. Anything else is a user-defined process module.
+    case process_name(process) do
+      "xor" -> unprocess_call(var, "unprocess_xor", process)
+      "rol" -> unprocess_call(var, "unprocess_rotate_left", process)
+      "rotate_left" -> unprocess_call(var, "unprocess_rotate_left", process)
+      "ror" -> unprocess_call(var, "process_rotate_left", process)
+      _ -> custom_process_inverse(var, process)
     end
   end
 
   defp maybe_process_inverse(_attr, _var), do: ""
+
+  defp process_name(process), do: process |> String.split("(", parts: 2) |> hd()
+
+  defp unprocess_call(var, fun, process) do
+    arg = process |> extract_process_arg() |> translate_expr_for_instance()
+    "#{var} = Ksc.Stream.#{fun}(#{var}, #{arg})"
+  end
+
+  defp custom_process_inverse(var, process) do
+    {mod_name, args} = parse_custom_process(process)
+    args_str = Enum.map_join(args, ", ", &translate_expr_for_instance/1)
+    "process = #{mod_name}.new(#{args_str})\n#{var} = #{mod_name}.encode(process, #{var})"
+  end
 
   # Look up the inner type's first seq field's pad-right byte. Used when a sized
   # outer user-type wraps a `size-eos: true` inner string with pad-right: the
@@ -3534,59 +3490,70 @@ defmodule Ksc.Compiler.ElixirCompiler do
   end
 
   defp render_controller_assignment({ctrl_id, controlled_id, kind, inversion, encoding}) do
-    actual =
-      case kind do
-        :byte_size ->
-          "byte_size(map_[:#{controlled_id}])"
-
-        :str_byte_size ->
-          "byte_size(Ksc.Stream.encode_string(map_[:#{controlled_id}], \"#{encoding}\"))"
-
-        :length ->
-          "length(map_[:#{controlled_id}])"
-      end
+    actual = measured_length(kind, field_read(controlled_id), encoding)
 
     case inversion do
       :identity ->
-        "map_ = Map.put(map_, :#{ctrl_id}, #{actual})"
-
-      {:sub, n} ->
-        "map_ = Map.put(map_, :#{ctrl_id}, #{actual} - #{n})"
+        put_controller(ctrl_id, actual)
 
       {:add, n} ->
-        "map_ = Map.put(map_, :#{ctrl_id}, #{actual} + #{n})"
+        put_controller(ctrl_id, "#{actual} + #{n}")
+
+      {:sub, n} ->
+        put_controller(ctrl_id, "#{actual} - #{n}")
 
       {:rsub, n} ->
-        "map_ = Map.put(map_, :#{ctrl_id}, #{n} - #{actual})"
+        put_controller(ctrl_id, "#{n} - #{actual}")
 
       {:mul, n} ->
-        "map_ = Map.put(map_, :#{ctrl_id}, #{actual} * #{n})"
+        put_controller(ctrl_id, "#{actual} * #{n}")
 
       {:div, n} ->
-        var = "ctrl_#{ctrl_id}_"
+        v = "ctrl_#{ctrl_id}_"
 
-        """
-        #{var} = #{actual}
-        if #{n} == 0 or rem(#{var}, #{n}) != 0 do
-          raise ArgumentError,
-            "non_invertible_controller: :#{ctrl_id} :div #{n} got " <> Integer.to_string(#{var})
-        end
-        map_ = Map.put(map_, :#{ctrl_id}, div(#{var}, #{n}))
-        """
-        |> String.trim()
+        checked_division(
+          ctrl_id,
+          actual,
+          v,
+          "#{n} == 0 or rem(#{v}, #{n}) != 0",
+          "div(#{v}, #{n})",
+          "div #{n}"
+        )
 
       {:rdiv, n} ->
-        var = "ctrl_#{ctrl_id}_"
+        v = "ctrl_#{ctrl_id}_"
 
-        """
-        #{var} = #{actual}
-        if #{var} == 0 or rem(#{n}, #{var}) != 0 do
-          raise ArgumentError,
-            "non_invertible_controller: :#{ctrl_id} :rdiv #{n} got " <> Integer.to_string(#{var})
-        end
-        map_ = Map.put(map_, :#{ctrl_id}, div(#{n}, #{var}))
-        """
-        |> String.trim()
+        checked_division(
+          ctrl_id,
+          actual,
+          v,
+          "#{v} == 0 or rem(#{n}, #{v}) != 0",
+          "div(#{n}, #{v})",
+          "rdiv #{n}"
+        )
     end
+  end
+
+  # The source expression that measures the controlled field's encoded length.
+  defp measured_length(:byte_size, value, _encoding), do: "byte_size(#{value})"
+  defp measured_length(:length, value, _encoding), do: "length(#{value})"
+
+  defp measured_length(:str_byte_size, value, encoding),
+    do: "byte_size(Ksc.Stream.encode_string(#{value}, \"#{encoding}\"))"
+
+  defp put_controller(ctrl_id, expr), do: "map_ = Map.put(map_, :#{ctrl_id}, #{expr})"
+
+  # A controller whose inversion divides: guard against a non-exact division
+  # (which would silently lose information) before writing the recovered value.
+  defp checked_division(ctrl_id, actual, var, guard, result, label) do
+    """
+    #{var} = #{actual}
+    if #{guard} do
+      raise ArgumentError,
+        "non_invertible_controller: :#{ctrl_id} :#{label} got " <> Integer.to_string(#{var})
+    end
+    #{put_controller(ctrl_id, result)}
+    """
+    |> String.trim()
   end
 end

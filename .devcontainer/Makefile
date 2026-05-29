@@ -1,4 +1,4 @@
-.PHONY: list dc.up dc.status dc.stop dc.rebuild dc.rebuild.force dc.down dc.shell dc.claude dc.bun.install dc.tidewave dc.tidewave.bg dc.tidewave.stop dc.tidewave.update dc.logs.proxy dc.server dc.test dc.worktree.new dc.worktree.list dc.worktree.remove
+.PHONY: list dc.up dc.status dc.stop dc.rebuild dc.rebuild.force dc.down dc.shell dc.claude dc.claude.update dc.makefile.pull dc.bun.install dc.tidewave dc.tidewave.bg dc.tidewave.stop dc.tidewave.update dc.logs.proxy dc.server dc.test dc.worktree.new dc.worktree.list dc.worktree.remove
 
 define require_devcontainer
 	@if [ "$$DEVCONTAINER" != "true" ]; then echo "Error: This command must be run inside the devcontainer." >&2; exit 1; fi
@@ -18,6 +18,8 @@ list:
 		"" "" \
 		"# Commands to run inside the devcontainer" "" \
 		"make dc.claude"         "Run Claude Code (with --dangerously-skip-permissions)" \
+		"make dc.claude.update"  "Update Claude Code to the latest release" \
+		"make dc.makefile.pull"  "Update this Makefile from the upstream devcontainer repo" \
 		"make dc.bun.install"    "Installs the assets with bun" \
 		"make dc.tidewave"       "Run Tidewave (exposed on localhost:9833)" \
 		"make dc.tidewave.bg"    "Run Tidewave in the background" \
@@ -72,12 +74,24 @@ dc.claude:
 	$(require_devcontainer)
 	exec claude --dangerously-skip-permissions
 
+dc.claude.update:
+	$(require_devcontainer)
+	@echo "Updating Claude Code to the latest release..."
+	@npm install -g @anthropic-ai/claude-code@latest \
+		&& echo "Claude Code updated: $$(claude --version 2>/dev/null || echo 'installed')"
+
+dc.makefile.pull:
+	@echo "Pulling latest Makefile from PJUllrich/devcontainer..."
+	@curl -sL https://github.com/PJUllrich/devcontainer/archive/refs/heads/main.tar.gz \
+		| tar xz --strip-components=2 devcontainer-main/.devcontainer/Makefile \
+		&& echo "Makefile updated."
+
 dc.bun.install:
 	exec mix bun assets install
 
 dc.tidewave:
 	$(require_devcontainer)
-	exec tidewave --allow-remote-access --allowed-origins http://localhost:9833
+	exec tidewave --allow-remote-access --allowed-origins http://localhost:9836
 
 dc.tidewave.bg:
 	@$(MAKE) dc.tidewave > /tmp/tidewave.log 2>&1 & echo "Tidewave started (pid $$!). Logs: /tmp/tidewave.log"

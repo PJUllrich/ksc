@@ -373,20 +373,29 @@ defmodule Ksc.Stream do
     for <<b <- data>>, into: <<>>, do: <<bxor(b, key)>>
   end
 
+  def process_xor(<<>>, _key), do: <<>>
+
   def process_xor(data, key) when is_binary(data) and is_binary(key) do
-    key_len = byte_size(key)
-    do_xor_key(data, key, key_len, 0, [])
+    # XOR the whole blob in one shot by treating both sides as big integers: the
+    # BEAM runs bignum `bxor` in C, so this beats a per-byte Elixir loop by ~7x
+    # with no extra dependencies. `encode_unsigned` drops leading zero bytes, so
+    # we left-pad back to the original size.
+    size = byte_size(data)
+    tiled = tile_key(key, size)
+    result = bxor(:binary.decode_unsigned(data), :binary.decode_unsigned(tiled))
+    encoded = :binary.encode_unsigned(result)
+    pad = size - byte_size(encoded)
+    if pad > 0, do: <<0::size(pad * 8), encoded::binary>>, else: encoded
   end
 
   def process_xor(data, key) when is_binary(data) and is_list(key) do
     process_xor(data, :binary.list_to_bin(key))
   end
 
-  defp do_xor_key(<<b, rest::binary>>, key, kl, i, acc) do
-    do_xor_key(rest, key, kl, i + 1, [bxor(b, :binary.at(key, rem(i, kl))) | acc])
+  defp tile_key(key, size) do
+    copies = div(size, byte_size(key)) + 1
+    key |> :binary.copy(copies) |> binary_part(0, size)
   end
-
-  defp do_xor_key(<<>>, _, _, _, acc), do: acc |> :lists.reverse() |> IO.iodata_to_binary()
 
   @doc "Rotate each byte left by amount bits."
   def process_rotate_left(data, amount) when is_binary(data) and is_integer(amount) do
